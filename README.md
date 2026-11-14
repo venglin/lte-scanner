@@ -1,7 +1,5 @@
 # lte-scanner — LTE PHY scanner and analyzer for HackRF
 
-*Polish version: [README.pl.md](README.pl.md)*
-
 A passive LTE downlink receiver written in pure Python (NumPy/SciPy). It is not a full
 3GPP stack. It demodulates the physical layer and understands the broadcast and control
 channels:
