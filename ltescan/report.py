@@ -52,6 +52,17 @@ def cell_text(rep: CellReport, show_dci: int = 0) -> str:
         L.append("SI messages: " + "; ".join(f"{k} x{v}" for k, v in seen.items()))
     if rep.paging or rep.rar:
         L.append(f"Paging (P-RNTI): {rep.paging} subframes, random access responses (RA-RNTI): {rep.rar}")
+    if rep.rar_entries:
+        d = sorted(e.distance_m for e in rep.rar_entries)
+        L.append(f"RAR: {len(rep.rar_entries)} responses, timing advance -> UE distance "
+                 f"{d[0]:.0f}..{d[-1]:.0f} m (median {d[len(d) // 2]:.0f} m)")
+    if rep.paging_msgs:
+        pm = rep.paging_msgs
+        L.append(f"Paging decoded: {len(pm)} messages, records: {sum(p.s_tmsi for p in pm)} S-TMSI, "
+                 f"{sum(p.imsi for p in pm)} IMSI (identities masked), "
+                 f"{sum(p.cs_domain for p in pm)} CS domain; "
+                 f"systemInfoModification: {'yes' if any(p.si_modification for p in pm) else 'no'}"
+                 + (", ETWS" if any(p.etws for p in pm) else ""))
     conf = rep.confirmed_rntis()
     if conf:
         top = ", ".join(f"0x{r:04x}x{n}" for r, n in list(conf.items())[:20])
@@ -64,6 +75,22 @@ def cell_text(rep: CellReport, show_dci: int = 0) -> str:
     for n in rep.notes:
         L.append(f"Note: {n}")
     return "\n".join(L)
+
+
+def burst_line(stamp: str, n: int, rep: CellReport, counts: dict) -> str:
+    """One status line per monitor burst."""
+    m = rep.mib
+    if m is None:
+        return f"{stamp} burst {n}: PCI {rep.sync.n_id} MIB not decoded"
+    cfi = rep.cfi_hist.most_common(1)[0][0] if rep.cfi_hist else "-"
+    load = np.mean(rep.cce_load) * 100 if rep.cce_load else 0
+    s = (f"{stamp} burst {n}: PCI {rep.sync.n_id} SFN {m.sfn:4d} "
+         f"RSRP {rep.rsrp_dbfs:6.1f} dBFS SINR {rep.snr_db:5.1f} dB CFI {cfi} CCE {load:3.0f}% | "
+         f"SI {counts.get('SI', 0)} RAR {counts.get('RAR', 0)} PCH {counts.get('PCH', 0)}")
+    conf = rep.confirmed_rntis()
+    if conf:
+        s += f" C-RNTI {len(conf)}"
+    return s
 
 
 def scan_table(reports: list[CellReport]) -> str:
@@ -99,6 +126,9 @@ def to_dict(rep: CellReport) -> dict:
         "subframes": rep.subframes, "paging_subframes": rep.paging, "rar": rep.rar,
         "cce_load": float(np.mean(rep.cce_load)) if rep.cce_load else None,
         "c_rnti": {f"0x{r:04x}": n for r, n in rep.confirmed_rntis().items()},
+        "rar_responses": [{"rapid": e.rapid, "ta": e.ta, "distance_m": round(e.distance_m),
+                           "temp_crnti": f"0x{e.temp_crnti:04x}"} for e in rep.rar_entries],
+        "paging_messages": [p.__dict__ for p in rep.paging_msgs],
         "notes": rep.notes,
     }
     if rep.mib:

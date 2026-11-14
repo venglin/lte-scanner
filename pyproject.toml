@@ -21,6 +21,7 @@ Homepage = "https://github.com/venglin/lte-scanner"
 
 [project.optional-dependencies]
 plot = ["matplotlib>=3.7"]
+fast = ["numba>=0.60"]
 test = ["pytest>=7"]
 
 [project.scripts]

@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 import numpy as np
 from scipy import signal
 
-from . import chest, control, dci as dcimod, mimo, pbch, pdsch, rrc
+from . import chest, control, dci as dcimod, mac, mimo, pbch, pdsch, rrc
+from .coding import bits_to_bytes
 from .dsp import mix, resample
 from .ofdm import bin_index, demod_subframe, subframe_len, symbol_offsets
 from .params import BASE_RATE, FFT_SIZE, TDD_MI, TDD_UL_DL, CellConfig, freq_to_earfcn, earfcn_to_band, sample_rate
@@ -120,6 +121,8 @@ class CellReport:
     dcis: list = field(default_factory=list)
     paging: int = 0
     rar: int = 0
+    rar_entries: list = field(default_factory=list)      # mac.RarEntry
+    paging_msgs: list = field(default_factory=list)      # mac.Paging (masked)
     cce_load: list = field(default_factory=list)
     subframes: int = 0
     notes: list = field(default_factory=list)
@@ -187,8 +190,17 @@ class LteReceiver:
 
     # ------------------------------------------------------------- full
     def analyze(self, cell: CellSync, decode_sib: bool = True, rnti_discovery: bool = False,
-                max_subframes: int | None = None, verbose=None) -> CellReport:
+                max_subframes: int | None = None, verbose=None, on_pdu=None,
+                decode_rar: bool = True, decode_paging: bool = False) -> CellReport:
+        """on_pdu(kind, rnti, sfn, sf, payload, t_offset) is called for every
+        decoded transport block: kind is "BCH" (MIB), "SI", "RAR" or "PCH"
+        (paging, with subscriber identities masked); t_offset is seconds
+        from the start of the buffer. Paging is decoded only when
+        decode_paging is set."""
         rep = CellReport(cell, self.fc)
+        self._on_pdu = on_pdu
+        self._decode_rar = decode_rar
+        self._decode_paging = decode_paging
         if self.fc:
             rep.ppm = -cell.cfo / self.fc * 1e6
         mib = self._mib(cell, rep)
@@ -196,6 +208,9 @@ class LteReceiver:
         if mib is None:
             rep.notes.append("MIB could not be decoded")
             return rep
+        if on_pdu:
+            raw = pbch.mib_pack(mib.n_rb, mib.phich_ext, mib.phich_ng, mib.sfn, mib.spare)
+            on_pdu("BCH", 0, mib.sfn, 0, bits_to_bytes(raw), cell.frame_start / BASE_RATE)
         cfg = CellConfig(cell.n_id, mib.n_rb, cell.cp_ext, cell.tdd, mib.n_ports,
                          mib.phich_ng, mib.phich_ext)
         rep.cfg = cfg
@@ -264,8 +279,12 @@ class LteReceiver:
                 m_i = TDD_MI[tdd_cfg][sf] if cfg.tdd else 1
                 found, load = self._pdcch(g, ce, cfg, sf, sfn, cfi, m_i, sizes, rnti_discovery)
             self._record(rep, found, load)
+            t_sf = (dem.t0 + j * dem.spacing) / dem.fs
             for ev, d in found:
-                if d.rnti != dcimod.SI_RNTI or d.fmt not in ("1A", "1C"):
+                if d.fmt not in ("1A", "1C"):
+                    continue
+                if d.rnti != dcimod.SI_RNTI:
+                    self._other_broadcast(g, ce, cfg, sf, sfn, cfi, d, rep, t_sf)
                     continue
                 is_sib1 = sf == 5 and sfn % 2 == 0
                 if is_sib1:
@@ -277,6 +296,7 @@ class LteReceiver:
                     rep.sib1_tx += 1
                     rep.diag["pdsch"] = pdsch.pdsch_symbols(g, ce.h, cfg, sf, cfi, d)[0]
                     if data:
+                        self._emit("SI", d.rnti, sfn, sf, data, t_sf)
                         self._handle_bcch(data, rep, sfn, sf, True)
                         if rep.sib1 and rep.sib1.tdd_config and cfg.tdd:
                             tdd_cfg = rep.sib1.tdd_config[0]
@@ -285,10 +305,40 @@ class LteReceiver:
                     for rv in rvs:
                         data, _ = pdsch.decode_pdsch(g, ce.h, ce.noise, cfg, sf, cfi, d, rv)
                         if data:
+                            self._emit("SI", d.rnti, sfn, sf, data, t_sf)
                             self._handle_bcch(data, rep, sfn, sf, False)
                             break
             if verbose:
                 verbose(j, n_sf)
+
+    def _emit(self, kind, rnti, sfn, sf, data, t):
+        if getattr(self, "_on_pdu", None):
+            self._on_pdu(kind, rnti, sfn, sf, data, t)
+
+    def _other_broadcast(self, g, ce, cfg, sf, sfn, cfi, d, rep, t_sf):
+        """PDSCH of RA-RNTI (random access response) and P-RNTI (paging)."""
+        is_rar = 1 <= d.rnti <= 60
+        if is_rar and not self._decode_rar:
+            return
+        if d.rnti == dcimod.P_RNTI and not self._decode_paging:
+            return
+        if not is_rar and d.rnti != dcimod.P_RNTI:
+            return
+        rvs = [d.rv] if d.fmt == "1A" else [0, 2, 3, 1]
+        for rv in rvs:
+            data, _ = pdsch.decode_pdsch(g, ce.h, ce.noise, cfg, sf, cfi, d, rv)
+            if data:
+                break
+        else:
+            return
+        if is_rar:
+            r = mac.parse_rar(data)
+            rep.rar_entries += r.entries
+            self._emit("RAR", d.rnti, sfn, sf, data, t_sf)
+        else:
+            masked, info = mac.mask_paging(data)
+            rep.paging_msgs.append(info)
+            self._emit("PCH", d.rnti, sfn, sf, masked, t_sf)
 
     def _handle_bcch(self, data: bytes, rep: CellReport, sfn, sf, is_sib1):
         try:
@@ -377,10 +427,8 @@ class LteReceiver:
     def _cce_activity(g, ce, cfg, cfi, m_i, n_cce):
         regs = control.pdcch_regs(cfg, cfi, m_i)
         n_reg = len(regs)
-        pw = np.empty(n_reg)
-        for i, (l, k0) in enumerate(regs):
-            k = control.reg_res(cfg, l, k0)
-            pw[i] = np.mean(np.abs(g[l, k]) ** 2)
+        ls, ks = control.reg_index(cfg, regs)
+        pw = (np.abs(g[ls, ks]) ** 2).reshape(n_reg, 4).mean(axis=1)
         perm = control.quad_permutation(n_reg, cfg.n_id)
         w = np.empty(n_reg)
         w[perm] = pw

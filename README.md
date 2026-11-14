@@ -15,7 +15,10 @@ channels:
 | PHICH | REG allocation (needed for PDCCH; including m_i for TDD) |
 | PDCCH | quadruplet de-interleaving, CCEs, blind decoding of the common search space (DCI 0/1A, 1C) for SI-/P-/RA-RNTI; optional discovery of active C-RNTIs (DCI 0/1A, 1) and CCE load |
 | PDSCH | type 2 allocation (localized and distributed VRB→PRB), TBS, QPSK, SFBC transmit diversity, rate matching, **turbo decoder** (max-log-MAP), CRC24A, HARQ combining of redundancy versions |
-| RRC (ASN.1 UPER) | **SIB1**: PLMN (MCC-MNC), TAC, Cell Identity (eNB ID + sector), band, cellBarred, q-RxLevMin, p-Max, SI scheduling, TDD configuration; SI messages: list of contained SIBs |
+| RRC (ASN.1 UPER) | **SIB1**: PLMN (MCC-MNC), TAC, Cell Identity (eNB ID + sector), band, cellBarred, q-RxLevMin, p-Max, SI scheduling, TDD configuration; SI messages: list of contained SIBs (full contents in Wireshark) |
+| MAC | **random access responses** (RA-RNTI: timing advance → UE distance, UL grant, temporary C-RNTI); **paging** (P-RNTI, opt-in, subscriber identities always masked) |
+| **Wireshark export** | every decoded transport block (MIB, SIB1, SI, RAR, paging) as MAC-LTE frames: live over UDP, into a pcap file, or piped into Wireshark; Wireshark then decodes all SIBs in full |
+| Monitor | continuous capture → decode → export loop on one carrier |
 | Scanner | fast 20 MHz captures, spectrum-based carrier detection, candidate testing on the 100 kHz raster, learning the HackRF ppm error |
 
 It also includes a built-in **eNB signal generator** (`ltescan synth`) with a channel
@@ -27,8 +30,11 @@ run the whole chain end to end without hardware.
 ```bash
 python -m venv .venv
 .venv\Scripts\activate          # Linux/macOS: source .venv/bin/activate
-pip install -e .[plot,test]
+pip install -e .[plot,test,fast]
 ```
+
+`fast` installs numba, which compiles the Viterbi and turbo decoders (see
+[Performance](#performance)). Everything also works without it, just slower.
 
 ### HackRF
 
@@ -61,6 +67,9 @@ ltescan cell --earfcn 1575 --rnti --dci 20 --plot plots --json cell.json
 # record IQ and analyze offline later
 ltescan record --earfcn 1575 --rate 15.36e6 --duration 0.2 --out b3.cs8
 ltescan cell --file b3.cs8
+
+# follow one carrier and stream everything to Wireshark (see below)
+ltescan monitor --earfcn 1575 --paging --rnti --pcap - | wireshark -k -i -
 ```
 
 Without hardware:
@@ -112,6 +121,37 @@ Active C-RNTIs (2): 0x1234x118, 0x4321x118
 - **Antenna**: an omnidirectional antenna for the LTE bands. The telescopic antenna that
   ships with the HackRF works where coverage is good.
 
+## Wireshark
+
+Decoded transport blocks are exported in Wireshark's *MAC-LTE* format (the one srsRAN
+and OpenAirInterface use). Wireshark dissects the MAC layer and hands BCH, BCCH and
+PCCH payloads to its LTE RRC dissector, so SIB2, SIB3, SIB5 and every other SIB are
+decoded in full: RACH and paging configuration, reference signal power, reselection
+thresholds and priorities, inter-frequency neighbours, and so on.
+
+| Option | Use |
+|---|---|
+| `--pcap FILE` | write a pcap file; open it in Wireshark, no settings needed |
+| `--pcap -` | pcap to stdout for live viewing: `... --pcap - \| wireshark -k -i -` |
+| `--udp [HOST:PORT]` | send UDP datagrams (default `127.0.0.1:5847`). In Wireshark capture on the loopback adapter and enable the `mac_lte_udp` heuristic (Analyze → Enabled Protocols) |
+| `--paging` | also decode paging. S-TMSI and IMSI digits are always zeroed before export; record counts, CS/PS domain and the systemInfoModification/ETWS flags are kept |
+| `--no-rar` | do not decode random access responses |
+
+With `--pcap -` all text output goes to stderr, so stdout carries only the pcap stream.
+On Windows give Wireshark's full path if it is not on `PATH`:
+`... --pcap - | "C:\Program Files\Wireshark\Wireshark.exe" -k -i -`.
+
+The options work with `cell` (one capture) and `monitor`. `monitor` repeats short
+captures (`--burst`, default 0.2 s) and prints one status line per burst:
+
+```
+21:08:31 burst 4: PCI 112 SFN 1010 RSRP  -50.5 dBFS SINR  10.3 dB CFI 2 CCE  61% | SI 25 RAR 0 PCH 17 C-RNTI 6
+```
+
+`monitor` is not continuous reception. Each burst is captured, then decoded, so there
+are gaps between bursts (about 3 s per cycle for a 0.3 s burst with HackRF, mostly
+`hackrf_transfer` start-up and decoding).
+
 ## How it works
 
 ```
@@ -146,6 +186,27 @@ Weaker cells found after interference cancellation whose MIB cannot be decoded a
 listed in one line as unconfirmed (they can be residues of the strongest cell); `--all`
 prints full reports for them.
 
+## Performance
+
+Profiling a 15 MHz cell showed where the time goes. With numba (the `fast` extra), per
+subframe of signal:
+
+| | NumPy only | with numba |
+|---|---|---|
+| without C-RNTI discovery | 9.1 ms | 4.3 ms |
+| with C-RNTI discovery | 23.3 ms | 5.7 ms |
+
+Without numba, Viterbi decoding of hundreds of PDCCH candidates dominated. The rest is
+interpreter overhead spread over many small operations (channel estimation, REG
+gathering, small FFTs).
+
+**A GPU would not help here.** Each work item is tiny (a Viterbi run over 72–288 soft
+bits, FFTs of 128–2048 points) and the trellis recursions are strictly sequential. Kernel
+launch and transfer latency would exceed the actual computation. A GPU only pays off for
+large batches, for example decoding all PDCCH candidates of many subframes at once or
+correlating PSS over every raster point of a wide scan. Real-time operation (1 ms per
+subframe) would need the remaining per-subframe Python code to move into compiled code.
+
 ## Layout
 
 ```
@@ -169,11 +230,14 @@ ltescan/
   sdr.py        HackRF (hackrf_transfer / SoapySDR), IQ files (.cs8/.cs16/.cf32/.npy)
   synth.py      eNB signal generator + channel model
   report.py     text/JSON reports, plots
+  mac.py        MAC RAR parsing, paging parsing and identity masking
+  export.py     MAC-LTE framing, UDP and pcap sinks for Wireshark
+  _jit.py       optional numba kernels (Viterbi, turbo max-log-MAP)
   cli.py        command-line interface
-tests/          49 tests (unit + end-to-end on synthetic signals)
+tests/          58 tests (unit, end-to-end on synthetic signals, Wireshark dissection)
 ```
 
-Tests: `pytest -q` (~35 s).
+Tests: `pytest -q` (~35 s). The Wireshark tests run when `tshark` is installed.
 
 ## Verification and limitations
 
@@ -201,6 +265,8 @@ Tests: `pytest -q` (~35 s).
 - cells of four operators found and decoded up to SIB1 in bands 3, 7, 8 and 20;
 - 5, 10, 15 and 20 MHz carriers, 2 and 4 CRS ports, PHICH Ng=1, DCI 1A for SIB1,
   multi-PLMN SIB1 (network sharing), SI messages;
+- random access responses and paging, exported to Wireshark and decoded there
+  (SIB2, SIB3, SIB5, paging records);
 - a 20 MHz cell decoded from a 20 Msps capture;
 - co-channel cells resolved on the same carrier;
 - the receiver clock error (here +13 ppm) estimated and then corrected with `--ppm`.
@@ -219,19 +285,22 @@ Other limitations:
 
 - only transport blocks with a single code block (≤ 6120 bits), which is enough for SI;
 - no decoding of user PDSCH, PMCH/MBSFN or PHICH (ACK/NACK);
-- SIB2 and later: only the type is recognized, not the contents;
+- SIB2 and later: the built-in report only names the SIB types; the full contents need
+  the Wireshark export;
 - TDD: the UL/DL configuration is only known from SIB1. Before that, only subframes 0
   and 5 are analyzed, and special subframes are skipped;
-- pure-Python performance: about 10–20 ms per subframe (slower with C-RNTI blind
-  decoding); this is offline analysis, not real time;
+- not real time: about 4–6 ms per subframe with numba (see Performance), so `monitor`
+  works in bursts with gaps;
 - RSRP is reported in dBFS. A value in dBm needs calibration of the receive chain.
 
 ## Legal notes
 
-The tool passively receives and decodes only **broadcast** information (MIB/SIB) that is
-transmitted openly to all terminals. It does not decode user traffic or the contents of
-paging messages (it only shows that paging occurred). The discovered C-RNTIs are
-temporary radio identifiers that are not linked to a subscriber's identity. Receiving
+The tool passively receives and decodes only **broadcast** information (MIB, SIBs,
+random access responses) that is transmitted openly to all terminals. It does not
+decode user traffic. Paging is decoded only on request (`--paging`), and the subscriber
+identities in it (S-TMSI, IMSI) are always zeroed before anything is reported or
+exported. The discovered C-RNTIs and temporary C-RNTIs are short-lived radio
+identifiers that are not linked to a subscriber's identity. Receiving
 and analyzing radio signals is subject to local law (for example, rules on the secrecy
 of communications). The tool is intended for educational, research and measurement use.
 

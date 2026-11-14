@@ -9,6 +9,8 @@ from functools import lru_cache
 
 import numpy as np
 
+from ._jit import HAVE_NUMBA, viterbi_core
+
 # ----------------------------------------------------------------------- bits
 
 
@@ -139,6 +141,8 @@ def viterbi_tb(llr: np.ndarray, wrap: int = 2) -> np.ndarray:
     k = llr.shape[1]
     ext = np.concatenate([llr] * (2 * wrap + 1), axis=1)
     pred, out = _trellis()
+    if HAVE_NUMBA:
+        return viterbi_core(np.ascontiguousarray(ext), pred, out)[wrap * k:(wrap + 1) * k]
     n = ext.shape[1]
     metric = np.zeros(64)
     dec = np.zeros((n, 64), dtype=np.uint8)

@@ -10,7 +10,7 @@ import numpy as np
 from . import coding
 from .control import (CFI_CODE, pcfich_regs, pcfich_scrambling, pdcch_regs,
                       pdcch_scrambling, phich_regs, quad_permutation, reg_res)
-from .dci import SI_RNTI, pack_1a, pack_1c, size_0_1a, size_1c
+from .dci import P_RNTI, SI_RNTI, pack_1a, pack_1c, size_0_1a, size_1c
 from .mimo import td_encode
 from .ofdm import mod_subframe
 from .params import TDD_MI, TDD_UL_DL, CellConfig
@@ -20,7 +20,7 @@ from .pdsch import (TBS_1C, TBS_PRB2, TBS_PRB3, dci_prbs, pdsch_e, pdsch_re,
 from .dci import Dci
 from .sequences import crs, crs_symbols, pss, sss
 from .turbo import tb_encode
-from . import rrc
+from . import mac, rrc
 
 
 
@@ -35,6 +35,8 @@ class SynthConfig:
     distributed: bool = False
     extra_rntis: list = field(default_factory=lambda: [0x1234, 0x4321])
     tdd_config: int = 1
+    rar: bool = True                 # RA-RNTI 3 response in subframe 0 of odd frames
+    paging: bool = True              # P-RNTI paging in subframe 9 of odd frames
 
 
 def default_sib1(cell: CellConfig) -> bytes:
@@ -175,6 +177,12 @@ class EnbSimulator:
             cw = tb_encode(tb, e, rv) ^ pdsch_scrambling(cfg, sf, SI_RNTI, e)
             y = td_encode(coding.qpsk_mod(cw), cfg.n_ports)
             grid[:, ls[:e // 2], ks[:e // 2]] = y
+        if sfn % 2 == 1 and self.sc.rar and sf == 0:
+            self._broadcast(grid, sf, cfi, 3, mac.encode_rar(17, 25, 0x12345, 0x4602), dcis)
+        if sfn % 2 == 1 and self.sc.paging and sf == 9 and self.is_dl(9) == "D":
+            msg = mac.encode_paging([("s-tmsi", 0xAB, 0xDEADBEEF, 0),
+                                     ("imsi", "260031234567890", 1)], si_modification=True)
+            self._broadcast(grid, sf, cfi, P_RNTI, msg, dcis)
         # some UE-specific traffic for RNTI discovery
         n_cce = len(pdcch_regs(cfg, cfi, self.m_i(sf))) // 9
         size = size_0_1a(cfg.n_rb, cfg.tdd)
@@ -188,6 +196,26 @@ class EnbSimulator:
         if n_sym_dl < n_sym:
             grid[:, n_sym_dl:] = 0
         return grid
+
+    def _broadcast(self, grid, sf, cfi, rnti, data: bytes, dcis, rb=(0, 4)):
+        """DCI 1A in the common search space (CCE 0, L4) + QPSK PDSCH."""
+        cfg = self.cfg
+        bits = coding.bytes_to_bits(data)
+        for col, tab in ((2, TBS_PRB2), (3, TBS_PRB3)):
+            hit = [(i, t) for i, t in enumerate(tab) if t >= len(bits)]
+            if hit:
+                mcs, tbs = hit[0]
+                break
+        payload = pack_1a(cfg.n_rb, rb[0], rb[1], mcs, 0, False, col, cfg.tdd)
+        dci = Dci("1A", rnti, False, False, rb[0], rb[1], mcs, rv=0, n_prb_1a=col)
+        dcis.append((payload, rnti, 0, 4))
+        pe, po = dci_prbs(dci, cfg.n_rb)
+        ls, ks = pdsch_re(cfg, sf, cfi, pe, po)
+        e = pdsch_e(len(ls), cfg)
+        tb = np.zeros(tbs, dtype=np.uint8)
+        tb[:len(bits)] = bits
+        cw = tb_encode(tb, e, 0) ^ pdsch_scrambling(cfg, sf, rnti, e)
+        grid[:, ls[:e // 2], ks[:e // 2]] = td_encode(coding.qpsk_mod(cw), cfg.n_ports)
 
     def generate(self, n_frames: int) -> np.ndarray:
         """Per-port time signals, shape (n_ports, n_samples)."""

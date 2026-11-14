@@ -7,6 +7,7 @@ from functools import lru_cache
 
 import numpy as np
 
+from ._jit import HAVE_NUMBA, map_core
 from .coding import CRC24A, PERM_TURBO, crc_attach, crc_check, subblock_perm
 
 # Table 5.1.3-3: code block sizes and QPP parameters
@@ -97,6 +98,11 @@ NEG = -1e30
 def _map_decode(ls, lp, la, tx, tz):
     """Max-log-MAP for one RSC. ls, lp, la: length K; tx, tz: tail LLRs.
     Returns a-posteriori LLR (length K)."""
+    if HAVE_NUMBA:
+        f = np.ascontiguousarray
+        return map_core(f(ls, np.float64), f(lp, np.float64), f(la, np.float64),
+                        f(tx, np.float64), f(tz, np.float64),
+                        _NXT, _ZB, _PRV_S, _PRV_U, _TAIL_U, _TAIL_Z)
     k = len(ls)
     lsa = ls + la
     # gamma[t, s, u]

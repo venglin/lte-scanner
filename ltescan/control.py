@@ -62,8 +62,10 @@ def pcfich_scrambling(cfg: CellConfig, sf: int) -> np.ndarray:
     return gold(c_init, 32)
 
 
-def _extract(grid, h, cfg, regs):
-    """Gather REs (and channel) of a list of (l, k0) REGs."""
+@lru_cache(maxsize=1024)
+def reg_index(cfg: CellConfig, regs: tuple) -> tuple[np.ndarray, np.ndarray]:
+    """(symbol, subcarrier) arrays of the data REs of a tuple of REGs, in
+    order (4 REs per REG). Cached: the layout only depends on the config."""
     ls, ks = [], []
     for l, k0 in regs:
         k = reg_res(cfg, l, k0)
@@ -71,6 +73,14 @@ def _extract(grid, h, cfg, regs):
         ks.append(k)
     ls = np.concatenate(ls)
     ks = np.concatenate(ks)
+    ls.setflags(write=False)
+    ks.setflags(write=False)
+    return ls, ks
+
+
+def _extract(grid, h, cfg, regs):
+    """Gather REs (and channel) of a list of (l, k0) REGs."""
+    ls, ks = reg_index(cfg, tuple(regs))
     return grid[ls, ks], h[:cfg.n_ports, ls, ks]
 
 
