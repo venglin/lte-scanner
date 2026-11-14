@@ -226,6 +226,11 @@ temporary radio identifiers that are not linked to a subscriber's identity. Rece
 and analyzing radio signals is subject to local law (for example, rules on the secrecy
 of communications). The tool is intended for educational, research and measurement use.
 
+## Authors
+
+- Przemysław Frasunek <przemyslaw@frasunek.com>
+- Claude (Anthropic), via Claude Code
+
 ## License
 
 MIT, see [LICENSE](LICENSE).

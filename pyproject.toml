@@ -7,6 +7,10 @@ name = "ltescan"
 version = "0.1.0"
 description = "Passive LTE physical layer scanner and analyzer for HackRF (PSS/SSS, MIB, PCFICH, PDCCH, SIB1)"
 readme = "README.md"
+authors = [
+    { name = "Przemysław Frasunek", email = "przemyslaw@frasunek.com" },
+    { name = "Claude (Anthropic)", email = "noreply@anthropic.com" },
+]
 license = { text = "MIT" }
 classifiers = ["License :: OSI Approved :: MIT License", "Programming Language :: Python :: 3", "Topic :: Communications :: Ham Radio"]
 requires-python = ">=3.10"

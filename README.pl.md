@@ -223,6 +223,11 @@ analiza sygnałów radiowych podlegają lokalnym przepisom (w Polsce m.in. tajem
 komunikacji w Prawie komunikacji elektronicznej). Narzędzie jest przeznaczone do
 celów edukacyjnych, badawczych i pomiarowych.
 
+## Autorzy
+
+- Przemysław Frasunek <przemyslaw@frasunek.com>
+- Claude (Anthropic), przez Claude Code
+
 ## Licencja
 
 MIT, zob. [LICENSE](LICENSE).
