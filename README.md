@@ -95,7 +95,11 @@ Active C-RNTIs (2): 0x1234x118, 0x4321x118
 
 - **Gain**: start with `--lna 24 --vga 20`. `record` warns about clipping. A signal that
   is too strong (e.g. close to a base station) saturates the 8-bit ADC; one that is too
-  weak does not pass the PSS threshold.
+  weak does not pass the PSS threshold. In the live tests 800/900 MHz worked with
+  `--lna 24 --vga 20` (the defaults clipped), while 1.8–2.6 GHz needed
+  `--lna 40 --vga 30 --amp`.
+- **Weak carriers**: if the spectrum shows a carrier but `scan` does not test it, lower
+  the spectral edge threshold, e.g. `--thresh 4`, or use `--exhaustive`.
 - **Clock**: the HackRF One crystal has a ±20 ppm tolerance, i.e. up to ±52 kHz at
   2.6 GHz. The default CFO search range is 20 ppm of the carrier frequency. The report
   gives the estimated clock error. Pass it later as `--ppm` (tuning correction) or
@@ -192,17 +196,24 @@ Tests: `pytest -q` (~35 s).
 - a random sweep of 50 configurations, all correct, no phantom cells;
 - a band scan through a fake `hackrf_transfer`.
 
-**Not tested on a live network.** The generator and the receiver share the same reading
-of the specification, so a mistake in the less common details could cancel out in the
-tests. This applies to:
+**Tested on live networks** (HackRF One, Poland):
 
-- PHICH REG placement (especially extended duration);
-- distributed VRB mapping;
-- PDSCH RE exclusions around PSS/SSS/PBCH for odd numbers of RBs (15/25/75);
+- cells of four operators found and decoded up to SIB1 in bands 3, 7, 8 and 20;
+- 5, 10, 15 and 20 MHz carriers, 2 and 4 CRS ports, PHICH Ng=1, DCI 1A for SIB1,
+  multi-PLMN SIB1 (network sharing), SI messages;
+- a 20 MHz cell decoded from a 20 Msps capture;
+- co-channel cells resolved on the same carrier;
+- the receiver clock error (here +13 ppm) estimated and then corrected with `--ppm`.
+
+Parts of the specification that the live tests did not exercise are checked only
+against the built-in generator, which shares the receiver's reading of the
+specification:
+
+- TDD (band 38 was not received at the test location);
+- extended PHICH duration and extended CP;
+- distributed VRB allocation and DCI 1C;
+- PDSCH RE exclusions around PSS/SSS/PBCH for 25-RB cells;
 - the TBS table for DCI 1C (from memory, no second source).
-
-Synchronization, MIB and PCFICH are not affected by these. If on a real signal the MIB
-decodes but SIB1 does not, start debugging in those places.
 
 Other limitations:
 

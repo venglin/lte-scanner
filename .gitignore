@@ -9,3 +9,4 @@ __pycache__/
 *.cf32.json
 out/
 .pytest_cache/
+captures/

@@ -16,10 +16,12 @@ class ChannelEstimate:
     rsrp: float              # linear, per RE, port 0
     rssi_re: float           # mean received power per RE in CRS symbols
     port_power: np.ndarray   # mean |h|^2 per port (to guess #ports)
+    noise_meas: float = 0.0  # noise + interference per CRS RE (for SINR)
 
     @property
     def snr_db(self) -> float:
-        return 10 * np.log10(max(self.rsrp, 1e-20) / max(self.noise, 1e-20))
+        n = self.noise_meas or self.noise
+        return 10 * np.log10(max(self.rsrp, 1e-20) / max(n, 1e-20))
 
     @property
     def rsrq_db(self) -> float:
@@ -53,6 +55,7 @@ def estimate(grid: np.ndarray, cfg: CellConfig, sf: int, n_ports: int | None = N
     kk = np.arange(n_sc)
     noise_acc, noise_n = 0.0, 0
     rsrp_acc, rsrp_n = 0.0, 0
+    ls0 = {}                       # port 0 LS estimates per symbol
     port_power = np.zeros(n_ports)
     for p in range(n_ports):
         syms, est = [], []
@@ -60,6 +63,7 @@ def estimate(grid: np.ndarray, cfg: CellConfig, sf: int, n_ports: int | None = N
             ls = grid[l, k] * np.conj(r)
             sm = _smooth(ls, smooth)
             if p == 0:
+                ls0[l] = ls
                 d = ls - sm
                 noise_acc += np.sum(np.abs(d) ** 2) / (1 - 1 / smooth if smooth > 1 else 1)
                 noise_n += len(d)
@@ -83,8 +87,21 @@ def estimate(grid: np.ndarray, cfg: CellConfig, sf: int, n_ports: int | None = N
                 j = np.searchsorted(syms, l)
                 a = (l - syms[j - 1]) / (syms[j] - syms[j - 1])
                 h[p, l] = (1 - a) * est[j - 1] + a * est[j]
+    raw = rsrp_acc / max(rsrp_n, 1)
+    # RSRP from the correlation of the same CRS positions one slot apart
+    # (|E[h1 h2*]|): white noise and uncorrelated interference average out,
+    # unlike "raw power - smoothing residual", which breaks down (goes
+    # negative) at low SINR or in frequency-selective channels.
+    corr = [ls0[l] * np.conj(ls0[l + cfg.n_symb]) for l in ls0 if l + cfg.n_symb in ls0]
+    if corr:
+        rsrp = float(np.abs(np.mean(np.concatenate(corr))))
+        rsrp = min(max(rsrp, 1e-3 * raw), raw)
+        noise_meas = max(raw - rsrp, 1e-3 * rsrp)
+    else:
+        noise_meas = noise_acc / max(noise_n, 1)
+        rsrp = max(raw - noise_meas, 1e-3 * raw)
+    # the smoothing residual stays the per-RE noise used to weight LLRs
     noise = noise_acc / max(noise_n, 1)
-    rsrp = max(rsrp_acc / max(rsrp_n, 1) - noise, 1e-20)
     crs_l = [l for l, _, _ in crs_positions(cfg, sf, 0)]
     rssi = float(np.mean(np.abs(grid[crs_l]) ** 2))
-    return ChannelEstimate(h, noise, rsrp, rssi, port_power)
+    return ChannelEstimate(h, noise, rsrp, rssi, port_power, noise_meas)

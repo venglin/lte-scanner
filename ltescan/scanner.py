@@ -65,7 +65,59 @@ def find_carriers(x: np.ndarray, fs: float, fc: float, thresh_db: float = 8.0,
         out.append(Carrier(fc + lo, fc + hi, bool(idx[0] > edge),
                            bool(idx[-1] < len(f) - 1 - edge),
                            float(np.median(p[idx]) - floor)))
+    # second detector, robust to the HackRF filter tilt and to captures that
+    # are almost fully occupied (where the percentile floor is meaningless)
+    for c in _edge_carriers(f, p, df, step_db=max(4.0, thresh_db)):
+        c.lo += fc
+        c.hi += fc
+        if not any(abs(c.lo - o.lo) < 200e3 and abs(c.hi - o.hi) < 200e3 for o in out):
+            out.append(c)
     return out, (f + fc, p)
+
+
+def _edge_carriers(f: np.ndarray, p: np.ndarray, df: float, step_db: float = 10.0):
+    """Carriers as regions between steep spectral edges. An LTE carrier's
+    spectrum drops by >20 dB within ~100 kHz at both ends, much faster than
+    any front-end filter slope."""
+    ps = ndimage.median_filter(p, size=max(3, int(70e3 / df) | 1))   # kill spurs/DC
+    w = max(2, int(100e3 / df))
+    c = np.concatenate([[0.0], np.cumsum(ps)])
+    i = np.arange(w, len(ps) - w)
+    right = (c[i + w + 1] - c[i + 1]) / w
+    left = (c[i] - c[i - w]) / w
+    d = np.zeros(len(ps))
+    d[i] = right - left
+    edges = []
+    for sign in (1, -1):
+        v = sign * d
+        cand = np.nonzero(v > step_db)[0]
+        for j in cand:
+            lo, hi = max(0, j - w), min(len(v), j + w + 1)
+            if v[j] == v[lo:hi].max():
+                edges.append((int(j), sign))
+    edges.sort()
+    out = []
+    start = None                       # index of the last rising edge
+    first = True
+    for j, sign in edges:
+        if sign > 0:
+            start = j
+        else:
+            if start is None and first:
+                lo_i, lo_real = 0, False
+            elif start is None:
+                continue
+            else:
+                lo_i, lo_real = start, True
+            if (j - lo_i) * df >= 0.9e6:
+                lvl = float(np.median(ps[lo_i:j]) - np.median(ps))
+                out.append(Carrier(f[lo_i], f[j], lo_real, True, lvl))
+            start = None
+        first = False
+    if start is not None and (len(ps) - 1 - start) * df >= 0.9e6:
+        out.append(Carrier(f[start], f[-1], True, False,
+                           float(np.median(ps[start:]) - np.median(ps))))
+    return out
 
 
 def snap(f: float) -> float:

@@ -124,7 +124,10 @@ def cmd_scan(a):
             res = ScanResult()
             for b in a.band:
                 r = sc.scan_band(src, b, a.rate, a.dwell, a.exhaustive, a.thresh)
-                res.reports += r.reports
+                # adjacent bands can overlap (e.g. 28 and 20): keep one entry
+                res.reports += [n for n in r.reports if not any(
+                    o.sync.n_id == n.sync.n_id and abs(o.fc - n.fc) < 0.5e6
+                    for o in res.reports)]
                 res.carriers += r.carriers
                 res.psd += r.psd
                 res.tested += r.tested
