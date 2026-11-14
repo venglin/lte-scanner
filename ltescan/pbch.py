@@ -25,7 +25,7 @@ class Mib:
 
     def describe(self) -> str:
         return (f"BW={self.n_rb} RB, PHICH duration={'ext' if self.phich_ext else 'normal'},"
-                f" Ng={PHICH_NG_NAME[self.phich_ng]}, SFN={self.sfn}, porty CRS={self.n_ports}")
+                f" Ng={PHICH_NG_NAME[self.phich_ng]}, SFN={self.sfn}, CRS ports={self.n_ports}")
 
 
 def mib_pack(n_rb: int, phich_ext: bool, phich_ng: int, sfn: int, spare: int = 0):

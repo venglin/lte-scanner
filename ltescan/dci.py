@@ -125,7 +125,7 @@ class Dci:
         if self.fmt == "0":
             return "DCI0 (uplink grant)"
         if self.fmt == "?":
-            return f"DCI ({self.raw}, pola niezinterpretowane)"
+            return f"DCI ({self.raw}, fields not interpreted)"
         alloc = (f"RBG bitmap {''.join(map(str, self.bitmap))}" if self.fmt == "1"
                  else f"VRB {self.rb_start}..{self.rb_start + self.n_vrb - 1}"
                  f"{' dist' if self.distributed else ''}{' gap2' if self.gap2 else ''}")

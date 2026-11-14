@@ -26,7 +26,7 @@ class BitReader:
 
     def read(self, n: int) -> int:
         if self.pos + n > len(self.b):
-            raise ValueError("koniec danych ASN.1")
+            raise ValueError("end of ASN.1 data")
         v = 0
         for x in self.b[self.pos:self.pos + n]:
             v = (v << 1) | int(x)
@@ -104,22 +104,22 @@ class Sib1:
         out = [
             f"PLMN: {', '.join(str(p) for p in self.plmns)}",
             f"TAC: {self.tac} (0x{self.tac:04x})",
-            f"Cell Identity: {self.cell_identity} (eNB {self.enb_id}, sektor {self.local_cell_id})",
-            f"Pasmo (freqBandIndicator): {self.band}",
-            f"cellBarred: {'TAK' if self.cell_barred else 'nie'}, "
+            f"Cell Identity: {self.cell_identity} (eNB {self.enb_id}, sector {self.local_cell_id})",
+            f"Band (freqBandIndicator): {self.band}",
+            f"cellBarred: {'YES' if self.cell_barred else 'no'}, "
             f"intraFreqReselection: {'allowed' if self.intra_freq_resel_allowed else 'notAllowed'}",
             f"q-RxLevMin: {self.q_rx_lev_min_dbm} dBm"
             + (f", p-Max: {self.p_max} dBm" if self.p_max is not None else ""),
             f"SI window: {self.si_window_ms} ms, systemInfoValueTag: {self.value_tag}",
         ]
         if self.csg_indication:
-            out.append(f"CSG: tak, id={self.csg_identity}")
+            out.append(f"CSG: yes, id={self.csg_identity}")
         if self.tdd_config:
             out.append(f"TDD: subframeAssignment sa{self.tdd_config[0]}, "
                        f"specialSubframePatterns ssp{self.tdd_config[1]}")
         for i, (per, sibs) in enumerate(self.scheduling):
             sibs = (["SIB2"] if i == 0 else []) + list(sibs)   # SIB2 always in SI-1
-            out.append(f"SI-{i + 1}: co {per} ramek: {', '.join(sibs) or '-'}")
+            out.append(f"SI-{i + 1}: every {per} frames: {', '.join(sibs) or '-'}")
         return out
 
 

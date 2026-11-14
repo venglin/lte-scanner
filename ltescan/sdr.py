@@ -52,8 +52,8 @@ class HackRfTransfer(IqSource):
         # exe may also be a command prefix list (e.g. [python, script])
         self.exe = list(exe) if isinstance(exe, (list, tuple)) else ([exe] if exe else None)
         if not self.exe:
-            raise RuntimeError("nie znaleziono 'hackrf_transfer' w PATH (zainstaluj HackRF host tools"
-                               " albo użyj --driver soapy)")
+            raise RuntimeError("'hackrf_transfer' not found in PATH (install the HackRF host tools"
+                               " or use --driver soapy)")
         self.lna = int(lna) // 8 * 8
         self.vga = int(vga) // 2 * 2
         self.amp = amp
@@ -77,7 +77,7 @@ class HackRfTransfer(IqSource):
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=30 + n / fs * 4)
             raw = np.fromfile(path, dtype=np.int8)
             if raw.size < 2 * total:
-                raise RuntimeError(f"hackrf_transfer zwrócił {raw.size // 2} z {total} próbek:\n"
+                raise RuntimeError(f"hackrf_transfer returned {raw.size // 2} of {total} samples:\n"
                                    + (res.stderr or res.stdout)[-800:])
         finally:
             try:
@@ -121,7 +121,7 @@ class SoapySource(IqSource):
             while got < n + skip:
                 r = d.readStream(st, [chunk], len(chunk), timeoutUs=1_000_000)
                 if r.ret <= 0:
-                    raise RuntimeError(f"SoapySDR readStream błąd {r.ret}")
+                    raise RuntimeError(f"SoapySDR readStream error {r.ret}")
                 m = min(r.ret, n + skip - got)
                 buf[got:got + m] = chunk[:m]
                 got += m
@@ -141,8 +141,8 @@ def open_sdr(driver: str = "auto", **kw) -> IqSource:
     try:
         return SoapySource(**kw)
     except ImportError as e:
-        raise RuntimeError("brak sterownika: zainstaluj hackrf_transfer (HackRF host tools) "
-                           "lub SoapySDR z modułem SoapyHackRF") from e
+        raise RuntimeError("no driver: install hackrf_transfer (HackRF host tools) "
+                           "or SoapySDR with the SoapyHackRF module") from e
 
 
 # ------------------------------------------------------------------ files
@@ -166,7 +166,7 @@ def read_iq(path: str | Path, fmt: str | None = None, max_samples: int | None = 
     path = Path(path)
     fmt = fmt or FORMATS.get(path.suffix.lower())
     if fmt is None:
-        raise ValueError(f"nieznany format pliku {path.suffix}; podaj --format")
+        raise ValueError(f"unknown file format {path.suffix}; give --format")
     meta = {}
     mp = meta_path(path)
     if mp.exists():

@@ -112,7 +112,7 @@ def earfcn_to_band(earfcn: int) -> int:
     for band, (_, _, lo, hi, _) in BANDS.items():
         if lo <= earfcn <= hi:
             return band
-    raise ValueError(f"EARFCN {earfcn} nie należy do żadnego znanego pasma")
+    raise ValueError(f"EARFCN {earfcn} does not belong to any known band")
 
 
 def earfcn_to_freq(earfcn: int) -> float:

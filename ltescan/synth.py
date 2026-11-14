@@ -74,7 +74,7 @@ class EnbSimulator:
                 if t >= need:
                     self.mcs, self.tbs, self.n_prb_1a = i, t, col
                     return
-        raise ValueError("SIB1 za duży")
+        raise ValueError("SIB1 too large")
 
     def is_dl(self, sf: int) -> str:
         if not self.cfg.tdd:

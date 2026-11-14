@@ -87,7 +87,7 @@ def pss_search(x: np.ndarray, cfo_max: float = 40e3, cfo_step: float = 5e3,
     n_valid = len(x) - N + 1
     n_fold = n_valid // HALF_FRAME
     if n_fold < 1:
-        raise ValueError("bufor za krótki do szukania PSS (min 5 ms)")
+        raise ValueError("buffer too short for PSS search (min 5 ms)")
     energy = _sliding_energy(x, N)[:n_valid]
     n = np.arange(N)
     cfos = cfo_center + np.arange(-cfo_max, cfo_max + 1e-6, cfo_step)

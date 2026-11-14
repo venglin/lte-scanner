@@ -137,7 +137,7 @@ class Scanner:
                 rep = rx.analyze(cell, decode_sib=False)
             if rep.mib is not None and self.ppm is None:
                 self.ppm = -cell.cfo / freq * 1e6
-                self.log(f"  oszacowany błąd zegara odbiornika: {self.ppm:+.2f} ppm")
+                self.log(f"  estimated receiver clock error: {self.ppm:+.2f} ppm")
             reps.append(rep)
         return reps
 
@@ -193,7 +193,7 @@ class Scanner:
             centres = [0.5 * (lo + hi)]
         res = ScanResult()
         for c in centres:
-            self.log(f"pasmo {band}: przechwytywanie {c / 1e6:.1f} MHz ({fs / 1e6:.0f} Msps)")
+            self.log(f"band {band}: capturing {c / 1e6:.1f} MHz ({fs / 1e6:.0f} Msps)")
             cap = source.capture(c, fs, int(dwell * fs), bb_filter=0.8 * fs)
             self.scan_buffer(cap.x, cap.fs, cap.fc, band, exhaustive, thresh_db, res)
         return res
@@ -243,9 +243,9 @@ def short_line(rep: CellReport) -> str:
     s = (f"{rep.fc / 1e6:9.3f} MHz EARFCN {e if e is not None else '-':>5}  PCI {rep.sync.n_id:3d} "
          f"{rep.sync.duplex} {'ext' if rep.sync.cp_ext else 'norm'}CP")
     if m:
-        s += f"  BW {m.n_rb:3d}RB  porty {m.n_ports}  SFN {m.sfn:4d}"
+        s += f"  BW {m.n_rb:3d}RB  ports {m.n_ports}  SFN {m.sfn:4d}"
     else:
-        s += "  (MIB nieodczytany)"
+        s += "  (MIB not decoded)"
     s += f"  RSRP {rep.rsrp_dbfs:6.1f} dBFS  SNR {rep.snr_db:5.1f} dB"
     return s
 

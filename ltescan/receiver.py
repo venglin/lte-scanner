@@ -178,7 +178,7 @@ class LteReceiver:
             frames.append((g, ce.h, ce.noise))
             meas.append(ce)
         if not frames:
-            rep.notes.append("za mało danych na dekodowanie PBCH")
+            rep.notes.append("not enough data to decode the PBCH")
             return None
         rep.rsrp_dbfs = 10 * np.log10(np.mean([m.rsrp for m in meas]) / 128)
         rep.snr_db = float(np.mean([m.snr_db for m in meas]))
@@ -194,7 +194,7 @@ class LteReceiver:
         mib = self._mib(cell, rep)
         rep.mib = mib
         if mib is None:
-            rep.notes.append("nie udało się zdekodować MIB")
+            rep.notes.append("MIB could not be decoded")
             return rep
         cfg = CellConfig(cell.n_id, mib.n_rb, cell.cp_ext, cell.tdd, mib.n_ports,
                          mib.phich_ng, mib.phich_ext)
@@ -203,9 +203,9 @@ class LteReceiver:
             return rep
         occupied = mib.n_rb * 180e3
         if self.fs < occupied:
-            rep.notes.append(f"próbkowanie {self.fs / 1e6:.2f} Msps < pasmo zajęte "
-                             f"{occupied / 1e6:.1f} MHz: brzegowe podnośne utracone, "
-                             "dekodowanie PDCCH/PDSCH może zawodzić")
+            rep.notes.append(f"sample rate {self.fs / 1e6:.2f} Msps < occupied bandwidth "
+                             f"{occupied / 1e6:.1f} MHz: edge subcarriers are lost, "
+                             "PDCCH/PDSCH decoding may fail")
         fs_lte = sample_rate(mib.n_rb)
         x = resample(self.x - np.mean(self.x), self.fs, fs_lte)
         x = mix(x, -cell.cfo, fs_lte)
@@ -294,7 +294,7 @@ class LteReceiver:
         try:
             msg = rrc.decode_bcch_dlsch(data)
         except Exception as e:                       # malformed / unsupported
-            rep.notes.append(f"SFN {sfn}.{sf}: błąd dekodowania ASN.1: {e}")
+            rep.notes.append(f"SFN {sfn}.{sf}: ASN.1 decoding error: {e}")
             return
         if isinstance(msg, rrc.Sib1):
             rep.sib1 = msg
@@ -344,7 +344,7 @@ class LteReceiver:
                     return None
                 # C-RNTI found by CRC + strong code agreement; fields of an
                 # unknown/other format cannot be interpreted reliably
-                d = dcimod.Dci("?", c.rnti, raw=f"{c.size} bitów")
+                d = dcimod.Dci("?", c.rnti, raw=f"{c.size} bits")
             used[cce:cce + agg] = True
             ev = DciEvent(sfn, sf, c.rnti, d.fmt, cce, agg, d.describe())
             return ev, d

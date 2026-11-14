@@ -71,24 +71,25 @@ ltescan synth --out test.cs8 --nrb 50 --pci 260 --ports 2 --snr 10 --cfo 23e3 --
 ltescan cell --file test.cs8 --rnti --dci 6 --plot wykresy
 ```
 
-Przykładowy wynik (`cell`):
+Przykładowy wynik (`cell`; komunikaty programu są po angielsku):
 
 ```
-Komórka PCI 260 (N_ID1=86, N_ID2=2) @ 1842.500 MHz, EARFCN 1575, pasmo 3
-Dupleks: FDD, CP: normal
-Synchronizacja: PSS metryka 0.93 (PMR 124), SSS metryka 1.00
-CFO: +22976 Hz, błąd zegara odbiornika ~ -12.47 ppm
+Cell PCI 260 (N_ID1=86, N_ID2=2) @ 1842.500 MHz, EARFCN 1575, band 3
+Duplex: FDD, CP: normal
+Sync: PSS metric 0.98 (PMR 133), SSS metric 1.00 (margin 2.07)
+CFO: +22976 Hz, receiver clock error ~ -12.47 ppm
 RSRP: -36.9 dBFS/RE, RSRQ: -8.0 dB, SINR(CRS): 25.9 dB
-MIB: pasmo 10 MHz (50 RB), porty CRS: 2, PHICH: normal, Ng=1/2, SFN=0
-Przeanalizowano 118 podramek; CFI2: 118; zajętość CCE PDCCH ~ 16%
+MIB: bandwidth 10 MHz (50 RB), CRS ports: 2, PHICH: normal, Ng=1/2, SFN=0
+Analyzed 118 subframes; CFI2: 118; PDCCH CCE load ~ 16%
 SIB1:
   PLMN: 260-03
   TAC: 6699 (0x1a2b)
-  Cell Identity: 3160327 (eNB 12345, sektor 7)
+  Cell Identity: 3160327 (eNB 12345, sector 7)
+  Band (freqBandIndicator): 3
   ...
-  SI-1: co 16 ramek: SIB2
-  SI-2: co 32 ramek: SIB3, SIB5
-Aktywne C-RNTI (2): 0x1234x118, 0x4321x118
+  SI-1: every 16 frames: SIB2
+  SI-2: every 32 frames: SIB3, SIB5
+Active C-RNTIs (2): 0x1234x118, 0x4321x118
 ```
 
 ### Praktyczne wskazówki dla HackRF
@@ -135,6 +136,10 @@ RNTI wynika z reszty CRC, więc pasuje „każda” pozycja. Prawdziwe kandydaty
 od szumu metryka: ponowne zakodowanie zdekodowanych bitów i ważona |LLR| zgodność z
 odebranymi bitami miękkimi. Losowe dane osiągają maks. ~0.95 / 0.83 / 0.73 / 0.67 dla
 agregacji 1/2/4/8. Raport pokazuje tylko RNTI widziane co najmniej 2 razy.
+
+Słabsze komórki znalezione po kasowaniu interferencji, dla których nie udało się
+zdekodować MIB, są wypisywane w jednej linii jako niepotwierdzone (mogą być resztkami
+najsilniejszej komórki). `--all` pokazuje dla nich pełne raporty.
 
 ## Struktura
 
@@ -217,3 +222,7 @@ tymczasowe identyfikatory radiowe, niepowiązane z tożsamością abonenta. Odbi
 analiza sygnałów radiowych podlegają lokalnym przepisom (w Polsce m.in. tajemnica
 komunikacji w Prawie komunikacji elektronicznej). Narzędzie jest przeznaczone do
 celów edukacyjnych, badawczych i pomiarowych.
+
+## Licencja
+
+MIT, zob. [LICENSE](LICENSE).

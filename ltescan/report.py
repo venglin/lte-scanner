@@ -15,61 +15,61 @@ from .receiver import CellReport
 def cell_text(rep: CellReport, show_dci: int = 0) -> str:
     s = rep.sync
     L = []
-    hdr = f"Komórka PCI {s.n_id} (N_ID1={s.n_id_1}, N_ID2={s.n_id_2})"
+    hdr = f"Cell PCI {s.n_id} (N_ID1={s.n_id_1}, N_ID2={s.n_id_2})"
     if rep.fc:
         hdr += f" @ {rep.fc / 1e6:.3f} MHz"
         if rep.earfcn is not None:
-            hdr += f", EARFCN {rep.earfcn}, pasmo {rep.band}"
+            hdr += f", EARFCN {rep.earfcn}, band {rep.band}"
     L.append(hdr)
     L.append("-" * len(hdr))
-    L.append(f"Dupleks: {s.duplex}, CP: {s.cp}")
-    L.append(f"Synchronizacja: PSS metryka {s.pss_metric:.2f} (PMR {s.pss_pmr:.0f}), "
-             f"SSS metryka {s.sss_metric:.2f}")
-    ppm = f", błąd zegara odbiornika ~ {rep.ppm:+.2f} ppm" if not np.isnan(rep.ppm) else ""
+    L.append(f"Duplex: {s.duplex}, CP: {s.cp}")
+    L.append(f"Sync: PSS metric {s.pss_metric:.2f} (PMR {s.pss_pmr:.0f}), "
+             f"SSS metric {s.sss_metric:.2f} (margin {s.sss_margin:.2f})")
+    ppm = f", receiver clock error ~ {rep.ppm:+.2f} ppm" if not np.isnan(rep.ppm) else ""
     L.append(f"CFO: {s.cfo:+.0f} Hz{ppm}")
     L.append(f"RSRP: {rep.rsrp_dbfs:.1f} dBFS/RE, RSRQ: {rep.rsrq_db:.1f} dB, "
              f"SINR(CRS): {rep.snr_db:.1f} dB")
     m = rep.mib
     if m:
-        L.append(f"MIB: pasmo {BANDWIDTH_MHZ[m.n_rb]} MHz ({m.n_rb} RB), porty CRS: {m.n_ports}, "
+        L.append(f"MIB: bandwidth {BANDWIDTH_MHZ[m.n_rb]} MHz ({m.n_rb} RB), CRS ports: {m.n_ports}, "
                  f"PHICH: {'extended' if m.phich_ext else 'normal'}, Ng={PHICH_NG_NAME[m.phich_ng]}, "
                  f"SFN={m.sfn}")
     else:
-        L.append("MIB: nie zdekodowano")
+        L.append("MIB: not decoded")
     if rep.subframes:
         cfi = ", ".join(f"CFI{k}: {v}" for k, v in sorted(rep.cfi_hist.items()))
         load = np.mean(rep.cce_load) * 100 if rep.cce_load else 0
-        L.append(f"Przeanalizowano {rep.subframes} podramek; {cfi}; zajętość CCE PDCCH ~ {load:.0f}%")
+        L.append(f"Analyzed {rep.subframes} subframes; {cfi}; PDCCH CCE load ~ {load:.0f}%")
     if rep.sib1:
-        L.append("SIB1:" + (f" (po {rep.sib1_tx} transmisjach)" if rep.sib1_tx > 1 else ""))
+        L.append("SIB1:" + (f" (after {rep.sib1_tx} transmissions)" if rep.sib1_tx > 1 else ""))
         L += ["  " + x for x in rep.sib1.lines()]
     elif rep.sib1_tx:
-        L.append(f"SIB1: nieudane dekodowanie ({rep.sib1_tx} transmisji)")
+        L.append(f"SIB1: decoding failed ({rep.sib1_tx} transmissions)")
     if rep.si:
         seen = Counter()
         for sfn, sf, si, _ in rep.si:
             seen[", ".join(si.sibs) + (f" (+{si.n_sibs - 1})" if si.n_sibs > 1 else "")] += 1
-        L.append("Wiadomości SI: " + "; ".join(f"{k} x{v}" for k, v in seen.items()))
+        L.append("SI messages: " + "; ".join(f"{k} x{v}" for k, v in seen.items()))
     if rep.paging or rep.rar:
-        L.append(f"Paging (P-RNTI): {rep.paging} podramek, odpowiedzi RA (RA-RNTI): {rep.rar}")
+        L.append(f"Paging (P-RNTI): {rep.paging} subframes, random access responses (RA-RNTI): {rep.rar}")
     conf = rep.confirmed_rntis()
     if conf:
         top = ", ".join(f"0x{r:04x}x{n}" for r, n in list(conf.items())[:20])
-        L.append(f"Aktywne C-RNTI ({len(conf)}): {top}")
+        L.append(f"Active C-RNTIs ({len(conf)}): {top}")
     if show_dci and rep.dcis:
         L.append("DCI:")
         for ev in rep.dcis[:show_dci]:
             L.append(f"  SFN {ev.sfn:4d}.{ev.sf} {rnti_type(ev.rnti):8s} 0x{ev.rnti:04x} "
                      f"CCE {ev.cce:3d} L{ev.agg} {ev.text}")
     for n in rep.notes:
-        L.append(f"Uwaga: {n}")
+        L.append(f"Note: {n}")
     return "\n".join(L)
 
 
 def scan_table(reports: list[CellReport]) -> str:
     if not reports:
-        return "Nie znaleziono komórek LTE."
-    hdr = (f"{'Częst. MHz':>10} {'EARFCN':>6} {'Pas.':>4} {'PCI':>4} {'Dup':>3} {'CP':>4} "
+        return "No LTE cells found."
+    hdr = (f"{'Freq MHz':>10} {'EARFCN':>6} {'Band':>4} {'PCI':>4} {'Dup':>3} {'CP':>4} "
            f"{'BW':>5} {'Ant':>3} {'RSRP dBFS':>9} {'SNR dB':>6} {'CFO Hz':>7}  PLMN / TAC / CellID")
     L = [hdr, "-" * len(hdr)]
     for r in sorted(reports, key=lambda r: (r.fc or 0, r.sync.n_id)):
@@ -169,9 +169,9 @@ def plot_cell(path_prefix, grid: np.ndarray, pbch_syms: np.ndarray | None = None
     ax = axs[0]
     ax.imshow(20 * np.log10(np.abs(grid.T) + 1e-6), aspect="auto", origin="lower",
               cmap="viridis", interpolation="nearest")
-    ax.set_title("Siatka zasobów (ramka, |Y| dB)")
-    ax.set_xlabel("symbol OFDM")
-    ax.set_ylabel("podnośna")
+    ax.set_title("Resource grid (one frame, |Y| dB)")
+    ax.set_xlabel("OFDM symbol")
+    ax.set_ylabel("subcarrier")
     ax = axs[1]
     if pbch_syms is not None:
         ax.plot(pbch_syms.real, pbch_syms.imag, ".", ms=2, label="PBCH")
@@ -182,14 +182,14 @@ def plot_cell(path_prefix, grid: np.ndarray, pbch_syms: np.ndarray | None = None
     ax.set_aspect("equal")
     ax.grid(alpha=0.3)
     ax.legend(loc="upper right")
-    ax.set_title("Konstelacje po korekcji kanału")
+    ax.set_title("Constellations after equalization")
     ax = axs[2]
     if h is not None:
         for p in range(h.shape[0]):
             ax.plot(20 * np.log10(np.abs(h[p, 0]) + 1e-9), lw=0.8, label=f"port {p}")
         ax.legend()
-    ax.set_title("Estymata kanału |H| (symbol 0)")
-    ax.set_xlabel("podnośna")
+    ax.set_title("Channel estimate |H| (symbol 0)")
+    ax.set_xlabel("subcarrier")
     ax.grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(f"{path_prefix}_cell.png", dpi=120)

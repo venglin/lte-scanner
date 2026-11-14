@@ -31,7 +31,7 @@ def code_block_size(b: int) -> int:
     for k in TURBO_K:
         if k >= b:
             return k
-    raise ValueError(f"blok {b} bitów wymaga segmentacji (nieobsługiwane)")
+    raise ValueError(f"a {b}-bit block needs code block segmentation (not supported)")
 
 
 # ------------------------------------------------------------- trellis

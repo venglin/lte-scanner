@@ -5,9 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ltescan"
 version = "0.1.0"
-description = "Skaner i analizator warstwy fizycznej LTE (PSS/SSS, MIB, PCFICH, PDCCH, SIB1) dla HackRF"
+description = "Passive LTE physical layer scanner and analyzer for HackRF (PSS/SSS, MIB, PCFICH, PDCCH, SIB1)"
+readme = "README.md"
+license = { text = "MIT" }
+classifiers = ["License :: OSI Approved :: MIT License", "Programming Language :: Python :: 3", "Topic :: Communications :: Ham Radio"]
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24", "scipy>=1.10"]
+
+[project.urls]
+Homepage = "https://github.com/venglin/lte-scanner"
 
 [project.optional-dependencies]
 plot = ["matplotlib>=3.7"]
