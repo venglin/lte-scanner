@@ -55,6 +55,10 @@ class NrSynthConfig:
     si_coreset0_crb: int = 0         # common RB of CORESET#0 (SI DMRS start at point A)
     si_tdra: int = 0                 # DCI time domain field of the SI messages
     si_tdra_list: tuple = ()         # pdsch-TimeDomainAllocationList (as in SIB1)
+    # TDD: slot pattern repeated over the frame (D / S / U; S = 6 downlink
+    # symbols, then guard and uplink); uplink symbols are left empty
+    tdd: str = ""
+    load: float | None = None        # filled PRBs: random share per slot (None = all)
 
     def mib(self, sfn: int, ssb_index: int) -> Mib:
         return Mib(sfn=sfn, half_frame=0, scs_common=self.scs, k_ssb=self.k_ssb,
@@ -85,13 +89,21 @@ def generate(cfg: NrSynthConfig, duration: float, fs_out: float = 20e6,
     pos = 0                                    # samples since the subframe start
     sym_per_sf = 14 * 2 ** mu
     sib = _Sib1Tx(cfg, f_ref) if cfg.sib1 is not None else None
+    prb_on: dict = {}
     for s in range(n_sym):
         frame, l = divmod(s, sym_per_frame)
         sfn = (cfg.sfn0 + frame) % 1024
         f = np.zeros(n, dtype=complex)
         if cfg.carrier_sc:
             q = rng.integers(0, 2, (2, len(fill_k)))
-            f[fill_k % n] = fill_amp * ((1 - 2 * q[0]) + 1j * (1 - 2 * q[1])) / np.sqrt(2)
+            vals = fill_amp * ((1 - 2 * q[0]) + 1j * (1 - 2 * q[1])) / np.sqrt(2)
+            if cfg.load is not None:
+                key = (frame, l // 14)
+                if key not in prb_on:
+                    prb_on.clear()
+                    prb_on[key] = rng.random(len(fill_k) // 12) < cfg.load
+                vals = vals * np.repeat(prb_on[key], 12)
+            f[fill_k % n] = vals
         if sib is not None:
             sib.apply(f, frame, sfn, l)
         if (frame * 10) % cfg.period_ms == 0:
@@ -100,6 +112,10 @@ def generate(cfg: NrSynthConfig, duration: float, fs_out: float = 20e6,
                 if s0 <= l < s0 + 4:
                     g = _ssb_cached(cfg, sfn, i)
                     f[k_rel % n] = g[l - s0] * 10 ** (cfg.beam_gain_db[i] / 20)
+        if cfg.tdd:
+            kind = cfg.tdd[(l // 14) % len(cfg.tdd)]
+            if kind == "U" or (kind == "S" and l % 14 >= 6):
+                f[:] = 0
         t = np.fft.ifft(f) * np.sqrt(n)
         c = cp + (extra if l % per_half_ms == 0 else 0)
         if l % sym_per_sf == 0:

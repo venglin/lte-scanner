@@ -597,6 +597,175 @@ def _nr_pcap(path, cells, sib1):
     log(f"saved {sink.count} NR RRC messages to {path}")
 
 
+def cmd_nrload(a):
+    """NR downlink PRB occupancy (energy, TDD aware) of one cell's carrier."""
+    import json
+    from .nr import load as L
+    from .nr.pdcch import coreset0
+    from .nr.search import ssb_search
+    from .nr.sib1 import decode_sib1, frame_refs, frames_in
+    t0 = time.time()
+    if a.file:
+        x, fs, fc = load_file(a, a.duration)
+        if fc is None:
+            raise SystemExit("give --freq (no .json metadata file)")
+        src = None
+    else:
+        fs = a.rate
+        plan = _nr_plan(a, fs)
+        if len(plan) != 1:
+            raise SystemExit("nrload follows one cell: give --gscn, --arfcn or --freq")
+        fc, scs_plan, grp = plan[0]
+        src = open_source(a)
+        log(f"capturing 0.1 s @ {fc / 1e6:.3f} MHz to find the cell ...")
+        x = src.capture(fc, fs, int(0.1 * fs), bb_filter=0.75 * fs).x
+    cells = [c for c in ssb_search(x, fs, fc, gscns=[a.gscn] if a.gscn else None,
+                                   cfo_max=a.cfo_max) if c.confirmed]
+    if a.pci is not None:
+        cells = [c for c in cells if c.n_id == a.pci]
+    if not cells:
+        print("No NR cell found.")
+        return 1
+    cell = cells[0]
+    c0 = coreset0(cell.mib, cell.f_ref, cell.scs)
+    ref_fc = fc
+    if src is not None:
+        # reference capture: CORESET#0 (SIB1 -> carrier) or the SSB
+        ref_fc = (c0.f_center + 0.5e6) if c0 else cell.f_ref + 1e6
+
+    if src is not None and hasattr(src, "vga"):
+        src.vga_max = src.vga
+
+    def capture(fc_):
+        for _ in range(3):
+            cap = src.capture(fc_, fs, int(a.burst * fs), bb_filter=min(fs, 20e6))
+            peak = float(np.max(np.abs(np.concatenate([cap.x.real, cap.x.imag]))))
+            if peak <= 0.98 or not hasattr(src, "vga") or src.vga == 0:
+                break
+            # clipping spreads energy over every PRB: lower the gain, again
+            _monitor_agc(src, cap.x)
+        return cap.x
+
+    def sync(xr, fcr):
+        found = [c for c in ssb_search(xr, fs, fcr, scs=cell.scs, gscns=[cell.gscn],
+                                       cfo_max=abs(cell.cfo) + 5e3)
+                 if c.n_id == cell.n_id and c.confirmed]
+        if not found:
+            return None, None
+        c = found[0]
+        frames = frames_in(frame_refs(c, c.scs), len(xr) / fs)
+        t_frame = next((f.t for f in frames if f.t >= 0), None)
+        return c, t_frame
+
+    xr = capture(ref_fc) if src is not None else x
+    cref, t_frame = sync(xr, ref_fc)
+    if cref is None and src is not None:
+        xr, ref_fc = x, fc                  # the capture the cell was found in
+        cref, t_frame = sync(xr, ref_fc)
+    if cref is None:
+        print(f"PCI {cell.n_id}: not found again in the reference capture")
+        return 1
+    # carrier PRB grid: from SIB1, else the common RB grid of the SSB (k_SSB),
+    # else aligned to the SSB itself
+    scs = cell.mib.scs_common if cell.mib.sib1_present else cell.scs
+    car_lo, car_rb, label = None, None, "SSB grid"
+    if c0 is not None:
+        r = decode_sib1(xr, fs, ref_fc, cref)
+        if r.sib1 is not None and r.carriers():
+            cs, car_rb, car_lo, _ = r.carriers()[0]
+            scs = cs * 1000
+            label = f"carrier {car_lo / 1e6:.3f}-{(car_lo + 12 * car_rb * scs) / 1e6:.3f} MHz"
+    if car_lo is None:
+        grid0 = cell.f_ref - 120 * cell.scs - (cell.mib.k_ssb * 15000 if c0 else 0)
+        half = int(0.42 * fs / (12 * scs))
+        car_lo, car_rb = grid0 - half * 12 * scs, 2 * half + 20
+    band_w = int(0.8 * fs / (12 * scs))
+
+    def ref_band(fcr):
+        p0 = max(0, int(np.ceil((fcr - 0.4 * fs - car_lo) / (12 * scs))))
+        p1 = min(car_rb, int((fcr + 0.4 * fs - car_lo) // (12 * scs)))
+        return L.Band(car_lo + 12 * scs * p0, p1 - p0, scs, p0)
+
+    chunks = []
+    if a.sweep and src is not None:
+        for p0 in range(0, car_rb, band_w):
+            p1 = min(car_rb, p0 + band_w)
+            chunks.append(L.Band(car_lo + 12 * scs * p0, p1 - p0, scs, p0))
+    csv_f = None
+    if a.csv:
+        import os
+        new = not os.path.exists(a.csv) or os.path.getsize(a.csv) == 0
+        csv_f = open(a.csv, "a", encoding="utf-8", newline="")
+        if new:
+            csv_f.write("time,round,pci,part,prb_lo,prb_hi,f_lo_mhz,f_hi_mhz,aligned,quality,"
+                        "dl_slots,dl_use,tdd\n")
+    use_acc = np.zeros(car_rb)
+    use_n = np.zeros(car_rb)
+    n_round = 0
+    try:
+        while not a.count or n_round < a.count:
+            n_round += 1
+            if n_round > 1 and src is not None:
+                xr = capture(ref_fc)
+                cref, t_frame = sync(xr, ref_fc)
+                if cref is None:
+                    print(f"round {n_round}: PCI {cell.n_id} not found", flush=True)
+                    continue
+            stamp = time.strftime("%H:%M:%S")
+            rb = ref_band(ref_fc)
+            ref = L.measure(xr, fs, ref_fc, rb, t_frame, cfo=cref.cfo)
+            pattern = ref.pattern
+            results = [("SSB", ref)]
+            for i, b in enumerate(chunks):
+                fcc = b.f_center
+                xc = capture(fcc)
+                results.append((f"{i + 1}", L.measure(xc, fs, fcc, b, None, pattern=pattern,
+                                                       cfo=cref.cfo)))
+            band_txt = cell.band
+            print(f"{stamp} round {n_round}: PCI {cell.n_id} {band_txt}, {label} "
+                  f"({car_rb} PRB x {scs // 1000} kHz), TDD {pattern.slots(scs)}", flush=True)
+            tot_u = tot_w = 0.0
+            for name, r in results:
+                b = r.band
+                mark = "" if r.aligned else "  (not aligned)"
+                print(f"   {name:>3} PRB {b.prb0:3d}-{b.prb0 + b.n_rb - 1:3d} "
+                      f"{b.f_low / 1e6:8.2f}-{b.f_high / 1e6:8.2f} MHz  [{L.bar(r.mean_use)}] "
+                      f"{r.mean_use * 100:3.0f}%{mark}", flush=True)
+                if r.aligned and (name != "SSB" or not chunks):
+                    tot_u += r.mean_use * b.n_rb
+                    tot_w += b.n_rb
+                    use_acc[b.prb0:b.prb0 + b.n_rb] += r.use
+                    use_n[b.prb0:b.prb0 + b.n_rb] += 1
+                if csv_f:
+                    csv_f.write(",".join(str(v) for v in (
+                        time.strftime("%Y-%m-%dT%H:%M:%S"), n_round, cell.n_id, name, b.prb0,
+                        b.prb0 + b.n_rb - 1, f"{b.f_low / 1e6:.3f}", f"{b.f_high / 1e6:.3f}",
+                        int(r.aligned), f"{r.align_quality:.2f}", r.n_slots,
+                        f"{r.mean_use:.3f}", pattern.slots(scs))) + "\n")
+                    csv_f.flush()
+            if tot_w:
+                part = f"{tot_w:.0f} of {car_rb} PRB" if tot_w < car_rb else "whole carrier"
+                print(f"   downlink PRB use {tot_u / tot_w * 100:.0f}% ({part})", flush=True)
+            if src is None:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if csv_f:
+            csv_f.close()
+    if a.json:
+        seen = use_n > 0
+        with open(a.json, "w", encoding="utf-8") as f:
+            json.dump({"pci": cell.n_id, "scs_khz": scs // 1000, "carrier_low_mhz": car_lo / 1e6,
+                       "n_rb": car_rb, "rounds": n_round,
+                       "prb_use": [round(float(u), 3) if s_ else None for u, s_ in
+                                   zip(np.where(seen, use_acc / np.maximum(use_n, 1), 0), seen)]},
+                      f, indent=1)
+        log(f"saved {a.json}")
+    log(f"done in {time.time() - t0:.1f} s")
+    return 0
+
+
 def cmd_synth(a):
     from .dsp import resample
     from .params import CellConfig
@@ -740,6 +909,28 @@ def build_parser():
     add_sdr_args(s)
     add_file_args(s)
     s.set_defaults(func=cmd_nr)
+
+    s = sub.add_parser("nrload", help="5G NR: downlink PRB occupancy of a cell's carrier "
+                                      "(energy, TDD aware)")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--freq", help="capture centre frequency")
+    g.add_argument("--gscn", type=int, help="the cell's synchronization raster entry")
+    g.add_argument("--arfcn", type=int, help="SSB NR-ARFCN")
+    s.add_argument("--pci", type=int, help="this cell (default: strongest)")
+    s.add_argument("--scs", type=int, choices=[15, 30], help="SSB subcarrier spacing [kHz]")
+    s.add_argument("--rate", type=float, default=20e6, help="sample rate (default 20 Msps)")
+    s.add_argument("--burst", type=float, default=0.2, help="capture length per band [s]")
+    s.add_argument("--count", type=int, default=1, help="rounds (0 = until Ctrl+C)")
+    s.add_argument("--sweep", action="store_true",
+                   help="also measure the whole carrier piece by piece (from SIB1)")
+    s.add_argument("--duration", type=float, default=None, help="(file) seconds to use")
+    s.add_argument("--cfo-max", type=float, default=None, help="CFO search range [Hz]")
+    s.add_argument("--band", help=argparse.SUPPRESS)
+    s.add_argument("--csv", metavar="FILE", help="append one line per band and round")
+    s.add_argument("--json", metavar="FILE", help="save the mean use of every PRB")
+    add_sdr_args(s)
+    add_file_args(s)
+    s.set_defaults(func=cmd_nrload)
 
     s = sub.add_parser("synth", help="generate a synthetic LTE signal for testing")
     s.add_argument("--out", required=True)

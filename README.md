@@ -14,7 +14,7 @@ channels. It is not a full 3GPP stack.
 - **LTE:** cell search, MIB, PDCCH blind decoding, turbo-coded PDSCH, SIB1 (PLMN, TAC,
   Cell ID), random access responses, paging, load monitoring (PDCCH and PRB use,
   active devices, CSV time series), and live export to Wireshark.
-- Built-in eNB and gNB signal generators, 98 tests, and live verification on four
+- Built-in eNB and gNB signal generators, 103 tests, and live verification on four
   Polish operators' networks.
 
 The 20 MHz HackRF is enough for NR too: an SS/PBCH block occupies 7.2 MHz even when
@@ -38,6 +38,7 @@ the carrier is 100 MHz wide (see [5G NR](#5g-nr)).
 | SI messages | SI-windows from the SIB1 schedule (38.331 5.2.2.3.2), searchSpaceOtherSystemInformation (monitoring slots, symbols, candidates) or every window slot, DCI 1_0 with SI indicator 1 on CORESET#0, the SIB1 pdsch-TimeDomainAllocationList, DMRS referenced to point A, PDCCH combining over windows, DCI matching and PDSCH combining per message |
 | RRC (ASN.1 UPER) | **SIB1**: PLMNs (MCC-MNC), TAC, RANAC, NR cell identity, cell reservation, q-RxLevMin/q-QualMin, connection establishment failure control, SI scheduling (SIB types, periodicity, window), frequency bands, offsetToPointA, carriers per SCS (position, bandwidth), initial BWP (common search spaces and CORESET, SIB1/OSI/paging/RA search space ids, PDSCH time domain allocation list); **SystemInformation**: contained SIBs, SIB2 head (q-Hyst, priority, thresholds, q-RxLevMin, s-IntraSearchP, t-ReselectionNR) |
 | Wireshark | MIB, SIB1 and SI messages to a pcap file for Wireshark's NR RRC dissector (`--pcap`) |
+| Occupancy (`nrload`) | downlink PRB use from energy on the carrier's PRB grid: TDD pattern from the power envelope, noise floor from the uplink symbols, sweep of a wide carrier in 20 MHz pieces aligned by their DL/UL envelope and cyclic prefix, CSV/JSON |
 
 ### LTE
 
@@ -103,6 +104,7 @@ ltescan nr --band n78 --ppm 13 --lna 40 --vga 40     # scan a whole band
 ltescan nr --gscn 7880 --duration 0.3                # one raster entry, weak cell
 ltescan nr --gscn 1902 --sib1 --pcap sib1.pcap       # + SIB1, also for Wireshark
 ltescan nr --gscn 1902 --si                          # + SIB1 and the SI messages
+ltescan nrload --gscn 7906 --sweep --count 0 --csv n78.csv   # downlink PRB use
 ltescan nr --file n78.cs8 --sib1 --json nr.json      # offline
 ```
 
@@ -375,6 +377,55 @@ On synthetic signals a SIB1 with MCS 2 decoded from a single transmission at 1 d
 PDSCH SINR, and with PDCCH and PDSCH combining over 0.3 s at −8 dB. Live, `--sib1`
 adds about 6 s per cell (capture, SSB search, decoding).
 
+### Downlink occupancy (`nrload`)
+
+NR has no cell-specific reference signal and the user DCIs (format 1_1) cannot be
+decoded without each phone's RRC configuration, so `nrload` measures occupancy from
+energy instead:
+
+```
+ltescan nrload --gscn 7906                       # the 20 MHz around the cell's SSB
+ltescan nrload --gscn 7906 --sweep --count 0     # the whole carrier, in rounds
+ltescan nrload --file n78.cs8 --gscn 7906 --json prb.json
+```
+
+1. The cell is found by its SSB; SIB1 gives the carrier (point A, number of PRBs,
+   SCS), so measurements use the carrier's own PRB grid. Without SIB1 (NSA cells)
+   the grid of the SSB is used.
+2. Every symbol of whole frames is demodulated (frame timing from the SSBs) and the
+   power of each PRB is the median of its 12 subcarriers, which ignores the receiver's
+   DC and narrowband spurs.
+3. The TDD pattern comes from the power of every symbol of the frame averaged over
+   frames: the uplink symbols carry almost nothing at a receiver away from the phones.
+   They give the noise floor of each PRB. Without visible uplink gaps (FDD, or a cell
+   too weak to show them) the floor is the quietest tenth of the slots.
+4. A PRB of a downlink slot counts as used when its power over the slot's PDSCH
+   symbols (from symbol 2, after the control region) is 1.1 dB above the floor, and
+   not less than 15 dB below the slot's strongest PRBs: a strong cell's transmitter
+   noise leaks into its empty PRBs about 25-30 dB below its PDSCH.
+5. `--sweep` measures the rest of a wide carrier in 20 MHz pieces. They contain no SSB,
+   so each piece is aligned by correlating its downlink/uplink envelope with the
+   pattern measured at the SSB (the pattern repeats every 5 or 10 ms, which is all
+   the alignment needs), then to the sample by the cyclic prefix. A timing error
+   beyond the CP would leak every symbol into its neighbours and look like load.
+
+On synthetic signals (random PRB load per slot, TDD, multipath) the measured use is
+within a few percent of the true one, the SSB's own PRBs included (about 2-4 % of an
+idle cell).
+
+What it measures, live:
+
+- **Massive-MIMO n78 cells** steer their PDSCH at the phones. A receiver elsewhere sees
+  the broadcast part (SSB, SIB1, the PDCCH region) but hardly any user data: at the
+  test location the n78 carrier showed downlink and uplink symbols within 0.2 dB of
+  each other outside the SIB1 slots, and `nrload` reports a few percent. For such
+  cells the result is a lower bound.
+- **Energy is energy**: other cells on the same carrier heard at the antenna count as
+  well. On a strong n28 test cell, slots without PDSCH sat a few dB above the thermal
+  floor; with heavy load the measured use matched the upper mode of the PRB levels
+  (82 % vs 84 %), with light load it overestimated (40 % vs about 25 %).
+- Weak cells near 0 dB SINR give unstable TDD patterns from round to round.
+
 ## How it works (LTE)
 
 ```
@@ -506,9 +557,10 @@ ltescan/
     ldpc_tables.py  base graphs BG1/BG2
     sib1.py     SIB1 and SI receiver: frame timing, occasions, SI-windows, combining
     rrc.py      ASN.1 UPER: NR SIB1, SystemInformation, SIB2 head
+    load.py     downlink occupancy from energy: TDD pattern, alignment, PRB use
     synth.py    gNB generator: SSB bursts, SIB1 and SI messages (PDCCH + PDSCH)
     report.py   NR text/JSON reports
-tests/          98 tests (unit, end-to-end on synthetic signals, Wireshark dissection)
+tests/          103 tests (unit, end-to-end on synthetic signals, Wireshark dissection)
 ```
 
 Tests: `pytest -q` (1–2 min). The Wireshark tests run when `tshark` is installed.
