@@ -409,6 +409,10 @@ def cmd_nr(a):
                     + (", ".join(f"PCI {c.n_id} @ {c.f_ref / 1e6:.2f} MHz" for c in conf)
                        or "-"))
     cells.sort(key=lambda c: (not c.confirmed, c.f_ref, -c.rsrp_dbfs))
+    sib1 = {}
+    if a.sib1:
+        sib1 = _nr_sib1(a, cells, x if a.file else None, fs, fc if a.file else None,
+                        None if a.file else src)
     shown = [c for c in cells if c.confirmed or a.all]
     hidden = len(cells) - len(shown)
     note = (f"({hidden} SSB detection(s) without a valid PBCH CRC hidden; --all shows them)"
@@ -421,15 +425,77 @@ def cmd_nr(a):
         print()
     for c in shown:
         print(nrrep.cell_text(c))
+        if id(c) in sib1:
+            print(nrrep.sib1_text(sib1[id(c)]))
         print()
     if note:
         print(note)
     if a.json:
+        out = []
+        for c in shown:
+            d = nrrep.to_dict(c)
+            if id(c) in sib1:
+                d["sib1"] = nrrep.sib1_dict(sib1[id(c)])
+            out.append(d)
         with open(a.json, "w", encoding="utf-8") as f:
-            json.dump([nrrep.to_dict(c) for c in shown], f, indent=2)
+            json.dump(out, f, indent=2)
         log(f"saved {a.json}")
+    if a.pcap:
+        _nr_pcap(a.pcap, [c for c in shown if c.confirmed], sib1)
     log(f"done in {time.time() - t0:.1f} s")
     return 0
+
+
+def _nr_sib1(a, cells, x, fs, fc, src) -> dict:
+    """SIB1 of every confirmed cell that has a CORESET#0: from the file, or
+    from a new capture centred on CORESET#0 (SSBs found again for timing)."""
+    from .nr.pdcch import coreset0
+    from .nr.search import ssb_search
+    from .nr.sib1 import Sib1Result, decode_sib1
+    out = {}
+    for c in cells:
+        if not c.confirmed or not c.mib.sib1_present:
+            continue
+        if src is None:
+            out[id(c)] = decode_sib1(x, fs, fc, c, log=log)
+            continue
+        c0 = coreset0(c.mib, c.f_ref, c.scs)
+        if c0 is None:
+            out[id(c)] = decode_sib1(np.zeros(1, np.complex64), fs, c.f_ref, c)
+            continue
+        # keep the HackRF DC spike off the CORESET centre when there is room
+        off = 0.5e6 if c0.bandwidth / 2 + 0.5e6 <= 0.47 * fs else 0.0
+        fc2 = c0.f_center + off
+        log(f"PCI {c.n_id}: capturing {a.sib1_duration:.2f} s @ {fc2 / 1e6:.3f} MHz "
+            f"(CORESET#0 {c0.n_rb} RB x {c0.scs // 1000} kHz) ...")
+        cap = src.capture(fc2, fs, int(a.sib1_duration * fs),
+                          bb_filter=min(c0.bandwidth + 2 * off + 1e6, fs))
+        again = [d for d in ssb_search(cap.x, cap.fs, fc2, scs=c.scs, gscns=[c.gscn],
+                                       cfo_max=abs(c.cfo) + 5e3)
+                 if d.n_id == c.n_id and d.confirmed]
+        if not again:
+            r = Sib1Result(c.n_id, c0)
+            r.error = "cell not found again in the SIB1 capture"
+            out[id(c)] = r
+            continue
+        out[id(c)] = decode_sib1(cap.x, cap.fs, fc2, again[0], log=log)
+    return out
+
+
+def _nr_pcap(path, cells, sib1):
+    """MIB (BCCH-BCH) and SIB1 (BCCH-DL-SCH) records for Wireshark's NR RRC."""
+    from .coding import bits_to_bytes
+    from .export import PcapSink
+    from .nr.pbch import mib_bits
+    sink = PcapSink(path)
+    t = time.time()
+    for c in cells:
+        sink.send(bits_to_bytes(mib_bits(c.mib)), t, b"nr-rrc.bcch.bch")
+        r = sib1.get(id(c))
+        if r is not None and r.payload is not None:
+            sink.send(r.payload, t, b"nr-rrc.bcch.dl.sch")
+    sink.close()
+    log(f"saved {sink.count} NR RRC messages to {path}")
 
 
 def cmd_synth(a):
@@ -538,7 +604,7 @@ def build_parser():
     add_file_args(s)
     s.set_defaults(func=cmd_monitor)
 
-    s = sub.add_parser("nr", help="5G NR: find SS/PBCH blocks and decode the MIB")
+    s = sub.add_parser("nr", help="5G NR: find SS/PBCH blocks, decode the MIB (and SIB1)")
     g = s.add_mutually_exclusive_group()
     g.add_argument("--freq", help="capture centre frequency (all GSCNs inside are searched)")
     g.add_argument("--gscn", type=int, help="one synchronization raster entry")
@@ -555,6 +621,14 @@ def build_parser():
     s.add_argument("--all", action="store_true",
                    help="also show SSB detections whose PBCH did not decode")
     s.add_argument("--json", help="save results to JSON")
+    s.add_argument("--sib1", action="store_true",
+                   help="also decode SIB1 (PDCCH on CORESET#0 + PDSCH). Live: one more capture "
+                        "per cell, centred on its CORESET#0")
+    s.add_argument("--sib1-duration", type=float, default=0.2,
+                   help="length of the SIB1 capture [s] (default 0.2; repetitions are "
+                        "soft-combined, longer helps weak cells)")
+    s.add_argument("--pcap", metavar="FILE",
+                   help="write the MIBs and SIB1s to a pcap file for Wireshark (NR RRC)")
     add_sdr_args(s)
     add_file_args(s)
     s.set_defaults(func=cmd_nr)

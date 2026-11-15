@@ -83,15 +83,15 @@ class PcapSink:
         self.count = 0
 
     @staticmethod
-    def _exported_pdu(frame: bytes) -> bytes:
-        name = b"mac-lte-framed"
+    def _exported_pdu(frame: bytes, name: bytes = b"mac-lte-framed") -> bytes:
         padded = name + b"\0" * (-len(name) % 4 or 4)
         hdr = struct.pack(">HH", _EXP_PDU_TAG_DISSECTOR_NAME, len(padded)) + padded
         hdr += struct.pack(">HH", _EXP_PDU_TAG_END, 0)
         return hdr + frame
 
-    def send(self, frame: bytes, ts: float):
-        rec = self._exported_pdu(frame)
+    def send(self, frame: bytes, ts: float, dissector: bytes = b"mac-lte-framed"):
+        """dissector: Wireshark dissector for the payload, e.g. b"nr-rrc.bcch.dl.sch"."""
+        rec = self._exported_pdu(frame, dissector)
         sec = int(ts)
         usec = int(round((ts - sec) * 1e6))
         if usec >= 1_000_000:

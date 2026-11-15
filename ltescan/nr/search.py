@@ -419,7 +419,7 @@ def _margin(v: np.ndarray) -> tuple[int, float]:
 
 
 def _decode_cell(occs: list[_Occ], scs: int, n_id: int, margin: float,
-                 lms: list[int], w: int = 11) -> list[SsbObs]:
+                 lms: list[int], w: int = 11, n_try: int | None = None) -> list[SsbObs]:
     """DMRS hypothesis, channel estimate and PBCH decoding (alone, then
     soft-combined) of the occurrences of one SSB for a given cell id."""
     ib, dmrs_margin = _margin(sum(_dmrs_scores(o, n_id, w) for o in occs))
@@ -466,7 +466,7 @@ def _decode_cell(occs: list[_Occ], scs: int, n_id: int, margin: float,
         for lm in lms:
             # a clear SSS makes a real cell likely: afford trying every hypothesis
             r = pbch.combine_decode([ob.llr for ob in obs], half, n_id, ib, lm,
-                                    n_try=300 if margin >= 1.25 else 32)
+                                    n_try=n_try or (300 if margin >= 1.25 else 32))
             if r:
                 obs[0].mib, obs[0].combined = r
                 break
@@ -476,11 +476,17 @@ def _decode_cell(occs: list[_Occ], scs: int, n_id: int, margin: float,
     return obs
 
 
-def _decode_track(occs: list[_Occ], scs: int, l_max: tuple[int, ...]) -> list[SsbObs]:
+WEAK_SSS_TRACKS = 8          # tracks per search allowed the unclear-SSS path
+
+
+def _decode_track(occs: list[_Occ], scs: int, l_max: tuple[int, ...],
+                  budget: list[int] | None = None) -> list[SsbObs]:
     """Occurrences of one SSB (same cell and SSB index, one per period):
     common CFO, SSS decided on the sum over all occurrences, then PBCH. With
     several occurrences and an unclear SSS the next best cell ids are tried
-    too: the PBCH CRC (with the cell id in its scrambling) decides."""
+    too: the PBCH CRC (with the cell id in its scrambling) decides. That is
+    expensive and periodic data bursts (e.g. SIB1 every 20 ms) also form
+    tracks, so only `budget[0]` tracks per search may take that path."""
     if not occs:
         return []
     occs = _sync_track(occs, scs)
@@ -492,13 +498,19 @@ def _decode_track(occs: list[_Occ], scs: int, l_max: tuple[int, ...]) -> list[Ss
     sc = sum(_sss_scores(o, w) for o in occs)
     i1, margin = _margin(sc)
     cands = [i1]
+    n_try = None
     if margin < SSS_MARGIN_MIN:
         if len(occs) < 3 or margin < SSS_MARGIN_WEAK:
             return []
+        if budget is not None:
+            if budget[0] <= 0:
+                return []
+            budget[0] -= 1
         cands = [int(i) for i in np.argsort(sc)[::-1][:3]]
+        n_try = 16
     lms = list(l_max)
     for i in cands:
-        obs = _decode_cell(occs, scs, 3 * i + n_id_2, margin, lms, w)
+        obs = _decode_cell(occs, scs, 3 * i + n_id_2, margin, lms, w, n_try)
         if any(ob.mib for ob in obs) or margin >= SSS_MARGIN_MIN:
             return obs
     return []
@@ -550,6 +562,7 @@ def ssb_search(x: np.ndarray, fs: float, fc: float, scs: int | None = None,
                    and d.n_id_2 == pk.n_id_2 for d in done)
 
     obs: list[SsbObs] = []
+    budget = [WEAK_SSS_TRACKS]
     order = sorted(tracks.values(), key=lambda tr: -max(max(p.raw, p.metric) for p in tr))
     for tr in order:
         tr = [p for p in tr if not seen(p)]
@@ -561,7 +574,7 @@ def ssb_search(x: np.ndarray, fs: float, fc: float, scs: int | None = None,
         if top > 2 * PSS_THRESH:
             tr = [p for p in tr if p.raw > 0.2 * top]
         occs = [o for o in (_demod_occ(x, fs, fc, p, scs) for p in tr) if o]
-        new = _decode_track(occs, scs, l_max_candidates(tr[0].f_ref))
+        new = _decode_track(occs, scs, l_max_candidates(tr[0].f_ref), budget)
         if new:
             done.extend(tr)
             obs.extend(new)

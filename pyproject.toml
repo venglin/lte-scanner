@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ltescan"
 version = "0.1.0"
-description = "Passive LTE and 5G NR cell scanner and analyzer for HackRF (NR SS/PBCH + MIB, LTE MIB, PDCCH, SIB1)"
+description = "Passive LTE and 5G NR cell scanner and analyzer for HackRF (NR SS/PBCH, MIB, SIB1; LTE MIB, PDCCH, SIB1)"
 readme = "README.md"
 authors = [
     { name = "Przemysław Frasunek", email = "przemyslaw@frasunek.com" },

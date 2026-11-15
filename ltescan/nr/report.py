@@ -73,3 +73,96 @@ def to_dict(c: NrCell) -> dict:
             "intra_freq_reselection_allowed": m.intra_freq_reselection,
             "sib1_present": m.sib1_present},
     }
+
+
+def sib1_text(r) -> str:
+    """Report of a Sib1Result."""
+    c0 = r.coreset
+    L = []
+    if c0 is not None:
+        L.append(f"CORESET#0: {c0.n_rb} RB x {c0.n_symb} symbol(s), {c0.scs // 1000} kHz, "
+                 f"{c0.f_low / 1e6:.3f}-{(c0.f_low + c0.bandwidth) / 1e6:.3f} MHz; "
+                 f"search space #0: O = {c0.o:g} ms, M = {c0.m:g}")
+    if r.sib1 is None:
+        msg = r.error or "not decoded"
+        extra = (f" ({len(r.dcis)} DCI 1_0 with SI-RNTI in {r.slots_tried} slots)"
+                 if r.slots_tried else "")
+        L.insert(0, f"SIB1: {msg}{extra}")
+        return "\n".join("     " + x if i else x for i, x in enumerate(L))
+    a = r.alloc
+    mod = {2: "QPSK", 4: "16QAM", 6: "64QAM"}[a.qm]
+    lv = sorted({d.level for d in r.dcis})
+    rv = ",".join(str(v) for v in r.rvs) if len(r.rvs) <= 4 else         "/".join(str(v) for v in sorted(set(r.rvs)))
+    how = "" if r.combined == 1 else ", soft-combined"
+    L.insert(0, f"SIB1: decoded from {r.combined} transmission(s){how} (RV {rv}), "
+                f"PDSCH SINR {r.pdsch_sinr_db:.1f} dB")
+    L.append(f"PDSCH: DCI 1_0 SI-RNTI x{len(r.dcis)} (AL {'/'.join(map(str, lv))}), "
+             f"MCS {a.dci.mcs} {mod}, {len(a.prbs)} PRB, symbols {a.s}-{a.s + a.length - 1} "
+             f"(mapping {a.mapping}), TBS {a.tbs} bits")
+    s = r.sib1
+    for pi in s.plmn_info:
+        plmns = ", ".join(f"{mcc or '(same)'}-{mnc}" for mcc, mnc in pi.plmns)
+        tac = f"{pi.tac} (0x{pi.tac:06X})" if pi.tac is not None else "-"
+        L.append(f"PLMN {plmns}: TAC {tac}, NR cell identity {pi.cell_identity} "
+                 f"(0x{pi.cell_identity:09X})"
+                 + (", reserved for operator use" if pi.reserved_for_operator else ""))
+    sel = []
+    if s.q_rx_lev_min is not None:
+        sel.append(f"q-RxLevMin {s.q_rx_lev_min} dBm")
+    if s.q_qual_min is not None:
+        sel.append(f"q-QualMin {s.q_qual_min} dB")
+    if s.reserved_for_other_use:
+        sel.append("cellReservedForOtherUse")
+    if sel:
+        L.append("Cell selection: " + ", ".join(sel))
+    if s.si:
+        si = "; ".join(f"{'+'.join(sibs)} every {per} frames" for per, sibs in s.si)
+        L.append(f"SI scheduling: {si}; window {s.si_window_slots} slots")
+    if s.bands or s.carriers:
+        car = []
+        for scs, n_rb, lo, ctr in r.carriers():
+            bw = next((c.channel_mhz for c in s.carriers if c.scs_khz == scs and c.n_rb == n_rb),
+                      None)
+            car.append(f"{n_rb} PRB x {scs} kHz" + (f" ({bw} MHz channel)" if bw else "")
+                       + f", centre {ctr / 1e6:.3f} MHz")
+        pa = r.point_a
+        L.append("Carrier: band " + "/".join(f"n{b}" for b in s.bands)
+                 + (f", point A {pa / 1e6:.3f} MHz" if pa else "")
+                 + ("; " + "; ".join(car) if car else ""))
+    if not s.complete:
+        L.append("(rest of SIB1 not parsed: si-RequestConfig present)")
+    return "\n".join("     " + x if i else x for i, x in enumerate(L))
+
+
+def sib1_dict(r) -> dict:
+    c0 = r.coreset
+    out = {"decoded": r.sib1 is not None, "error": r.error,
+           "dci_count": len(r.dcis), "slots_tried": r.slots_tried}
+    if c0 is not None:
+        out["coreset0"] = {"n_rb": c0.n_rb, "n_symb": c0.n_symb, "scs_khz": c0.scs // 1000,
+                           "f_low_mhz": round(c0.f_low / 1e6, 4), "offset_rb": c0.offset,
+                           "ss0_o_ms": c0.o, "ss0_m": c0.m}
+    if r.alloc is not None:
+        a = r.alloc
+        out["pdsch"] = {"mcs": a.dci.mcs, "qm": a.qm, "n_prb": len(a.prbs), "start_symbol": a.s,
+                        "n_symbols": a.length, "tbs": a.tbs, "transmissions": r.combined,
+                        "sinr_db": None if r.pdsch_sinr_db is None else round(r.pdsch_sinr_db, 1)}
+    if r.payload is not None:
+        out["payload_hex"] = r.payload.hex()
+    s = r.sib1
+    if s is not None:
+        out["plmn_info"] = [{"plmns": [f"{m}-{n}" if m else n for m, n in pi.plmns],
+                             "tac": pi.tac, "ranac": pi.ranac, "nr_cell_identity": pi.cell_identity,
+                             "reserved_for_operator_use": pi.reserved_for_operator}
+                            for pi in s.plmn_info]
+        out["q_rx_lev_min_dbm"] = s.q_rx_lev_min
+        out["q_qual_min_db"] = s.q_qual_min
+        out["si_scheduling"] = [{"period_frames": p, "sibs": sibs} for p, sibs in s.si]
+        out["si_window_slots"] = s.si_window_slots
+        out["bands"] = s.bands
+        out["offset_to_point_a"] = s.offset_to_point_a
+        out["point_a_mhz"] = None if r.point_a is None else round(r.point_a / 1e6, 4)
+        out["carriers"] = [{"scs_khz": c.scs_khz, "n_rb": c.n_rb, "offset_to_carrier":
+                            c.offset_to_carrier, "channel_mhz": c.channel_mhz}
+                           for c in s.carriers]
+    return out

@@ -1,7 +1,9 @@
 """Polar code of TS 38.212 5.3.1 / 5.4.1 (downlink, without parity-check
-bits, as used by the PBCH): input bit interleaver, frozen set from the
-reliability sequence, encoder, sub-block interleaving rate matching and a
-CRC-aided successive-cancellation list decoder.
+bits, as used by the PBCH and the DCI): input bit interleaver, code length
+selection, frozen set from the reliability sequence (with the extra frozen
+bits of puncturing and shortening), encoder, sub-block interleaving rate
+matching (repetition, puncturing, shortening) and a CRC-aided
+successive-cancellation list decoder.
 
 LLR convention as elsewhere: positive means bit 0."""
 from __future__ import annotations
@@ -109,6 +111,39 @@ def info_set(k: int, n: int) -> np.ndarray:
     return s
 
 
+def code_length(k: int, e: int, n_max: int = 9) -> int:
+    """N of 38.212 5.3.1 (R_min = 1/8, n_min = 5)."""
+    ce = int(np.ceil(np.log2(e)))
+    n1 = ce - 1 if (8 * e <= 9 * 2 ** (ce - 1) and 16 * k < 9 * e) else ce
+    n2 = int(np.ceil(np.log2(8 * k)))
+    return 2 ** max(min(n1, n2, n_max), 5)
+
+
+def _punctured(k: int, e: int) -> bool:
+    return 16 * k <= 7 * e
+
+
+@lru_cache(maxsize=64)
+def info_set_rm(k: int, n: int, e: int) -> np.ndarray:
+    """Information bit indices for rate-matched length E (38.212 5.3.1.2:
+    with E < N the punctured or shortened positions, and for puncturing
+    also the lowest indices, are frozen first)."""
+    if e >= n:
+        return info_set(k, n)
+    j = subblock_index(n)
+    u = n - e
+    if _punctured(k, e):
+        frz = set(int(v) for v in j[:u])
+        t = int(np.ceil(3 * n / 4 - e / 2)) if e >= 3 * n / 4 else int(np.ceil(9 * n / 16 - e / 4))
+        frz |= set(range(t))
+    else:
+        frz = set(int(v) for v in j[e:])
+    q = [v for v in Q_MAX if v < n and v not in frz]
+    s = np.sort(np.array(q[-k:], dtype=np.int64))
+    s.setflags(write=False)
+    return s
+
+
 @lru_cache(maxsize=16)
 def subblock_index(n: int) -> np.ndarray:
     """J(n) of 38.212 5.4.1.1: y_n = d_J(n)."""
@@ -140,6 +175,38 @@ def encode(c: np.ndarray, n: int, e: int) -> np.ndarray:
     d = polar_transform(u)
     y = d[subblock_index(n)]
     return y[np.arange(e) % n]
+
+
+def encode_rm(c: np.ndarray, e: int, n_max: int = 9) -> np.ndarray:
+    """K bits -> E bits with any E (repetition, puncturing or shortening),
+    I_IL = 1, I_BIL = 0 (the DCI case)."""
+    c = np.asarray(c, dtype=np.uint8)
+    k = len(c)
+    n = code_length(k, e, n_max)
+    u = np.zeros(n, dtype=np.uint8)
+    u[info_set_rm(k, n, e)] = c[input_interleaver(k)]
+    y = polar_transform(u)[subblock_index(n)]
+    if e >= n:
+        return y[np.arange(e) % n]
+    return y[n - e:] if _punctured(k, e) else y[:e]
+
+
+def rate_dematch_rm(llr: np.ndarray, k: int, n_max: int = 9) -> np.ndarray:
+    """Inverse of encode_rm: E soft bits -> N soft bits of d."""
+    llr = np.asarray(llr, dtype=np.float64)
+    e = len(llr)
+    n = code_length(k, e, n_max)
+    if e >= n:
+        return rate_dematch(llr, n)
+    y = np.zeros(n)
+    if _punctured(k, e):
+        y[n - e:] = llr                     # punctured bits: no information
+    else:
+        y[:e] = llr
+        y[e:] = 1e4                         # shortened bits are known zeros
+    d = np.empty(n)
+    d[subblock_index(n)] = y
+    return d
 
 
 def rate_dematch(llr: np.ndarray, n: int) -> np.ndarray:
@@ -206,12 +273,13 @@ def _node(st: _List, alpha: np.ndarray, start: int):
     return np.concatenate([beta_l ^ beta_r, beta_r], axis=1), p1[p2]
 
 
-def decode(llr_d: np.ndarray, k: int, check, list_size: int = 8):
+def decode(llr_d: np.ndarray, k: int, check, list_size: int = 8, e: int | None = None):
     """CRC-aided SCL decoding. llr_d: N soft bits of d (after
-    rate_dematch); check(c) -> bool tests the K decoded bits (CRC).
+    rate_dematch); check(c) -> bool tests the K decoded bits (CRC); e: the
+    rate-matched length when it may be below N (frozen set).
     Returns the K bits c of the best path that passes `check`, else None."""
     n = len(llr_d)
-    info = info_set(k, n)
+    info = info_set(k, n) if e is None else info_set_rm(k, n, e)
     frozen = np.ones(n, dtype=bool)
     frozen[info] = False
     st = _List(frozen, list_size)
