@@ -41,8 +41,11 @@ class NrSynthConfig:
 
 
 def generate(cfg: NrSynthConfig, duration: float, fs_out: float = 20e6,
-             f_offset: float = 0.0) -> np.ndarray:
-    """Baseband signal at fs_out whose SS_REF lies at f_offset."""
+             f_offset: float = 0.0, f_ref: float = 0.0) -> np.ndarray:
+    """Baseband signal at fs_out whose SS_REF lies at f_offset. f_ref is
+    the RF frequency of SS_REF: like a real gNB (38.211 5.4) every symbol
+    then carries the phase -2 pi f_ref (t_start,l + N_CP,l Tc), with t
+    counted from the start of the subframe."""
     rng = np.random.default_rng(cfg.seed)
     mu = {15000: 0, 30000: 1}[cfg.scs]
     n = 1024
@@ -56,6 +59,8 @@ def generate(cfg: NrSynthConfig, duration: float, fs_out: float = 20e6,
     fill_k = np.arange(-cfg.carrier_sc // 2, cfg.carrier_sc // 2)
     fill_amp = 10 ** (cfg.fill_db / 20)
     out = []
+    pos = 0                                    # samples since the subframe start
+    sym_per_sf = 14 * 2 ** mu
     for s in range(n_sym):
         frame, l = divmod(s, sym_per_frame)
         sfn = (cfg.sfn0 + frame) % 1024
@@ -71,6 +76,11 @@ def generate(cfg: NrSynthConfig, duration: float, fs_out: float = 20e6,
                     f[k_rel % n] = g[l - s0] * 10 ** (cfg.beam_gain_db[i] / 20)
         t = np.fft.ifft(f) * np.sqrt(n)
         c = cp + (extra if l % per_half_ms == 0 else 0)
+        if l % sym_per_sf == 0:
+            pos = 0
+        if f_ref:
+            t = t * np.exp(-2j * np.pi * f_ref * (pos + c) / fs)
+        pos += c + n
         out.append(np.concatenate([t[-c:], t]))
     x = np.concatenate(out)[:int(duration * fs)]
     if f_offset:

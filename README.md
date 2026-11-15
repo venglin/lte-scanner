@@ -77,7 +77,7 @@ ltescan cell --file b3.cs8
 ltescan monitor --earfcn 1575 --paging --rnti --pcap - | wireshark -k -i -
 
 # 5G NR: scan a band for SS/PBCH blocks and decode their MIB (see below)
-ltescan nr --band n78 --ppm 13 --lna 40 --vga 30 --amp
+ltescan nr --band n78 --ppm 13 --lna 40 --vga 40
 ```
 
 Without hardware:
@@ -115,6 +115,11 @@ Active C-RNTIs (2): 0x1234x118, 0x4321x118
   weak does not pass the PSS threshold. In the live tests 800/900 MHz worked with
   `--lna 24 --vga 20` (the defaults clipped), while 1.8–2.6 GHz needed
   `--lna 40 --vga 30 --amp`.
+- **Check the RF amplifier**: the HackRF's RF amplifier is easily damaged (static, a
+  strong signal at the input). A dead amplifier does not just stop amplifying, it
+  attenuates: compare `ltescan cell` on a known cell with and without `--amp`. With a
+  working amplifier RSRP rises by about 14 dB; on the test unit it dropped by 14 dB,
+  so all later live tests ran without `--amp` (`--lna 40 --vga 40` for 3.5 GHz).
 - **Weak carriers**: if the spectrum shows a carrier but `scan` does not test it, lower
   the spectral edge threshold, e.g. `--thresh 4`, or use `--exhaustive`.
 - **Clock**: the HackRF One crystal has a ±20 ppm tolerance, i.e. up to ±52 kHz at
@@ -172,10 +177,21 @@ ltescan nr --arfcn 643296            # SSB ARFCN (absoluteFrequencySSB from RRC)
 ltescan nr --file n78.cs8 --json nr.json
 ```
 
-Known bands: n1, n3, n7, n8, n20, n28, n38, n40, n41, n77, n78. The SSB subcarrier
+Known bands: n1, n3, n7, n8, n20, n28, n38, n40, n41, n77, n78. A 100 MHz n78 carrier
+is far wider than the HackRF's 20 MHz, but that does not matter here: the SS/PBCH block
+occupies only 20 RB (7.2 MHz at 30 kHz) at one raster position inside the carrier, and
+the band scan tunes to every raster position in turn. The SSB subcarrier
 spacing comes from the band (`--scs 15|30` overrides it, e.g. for n38/n41 which allow
 both). The default capture is 45 ms, two SSB periods of 20 ms. Cells that send SSBs
 less often (NSA cells may use up to 160 ms) need a longer `--duration`.
+
+**Weak cells: capture longer.** Every SSB index of a cell repeats each period, and the
+receiver uses all repetitions in the capture (a "track"): the PSS correlation is
+averaged over periods, SSS and DMRS are decided on the sum, and when no single PBCH
+decodes the PBCHs are soft-combined. On synthetic signals, with `--duration 0.2` (ten
+blocks per beam) the MIB decodes down to about −10 dB SNR per resource element, against
+about −4 dB from single blocks. `--duration 0.3` was enough to decode a weak n78 cell in
+every attempt; analysing a 0.3 s capture of one GSCN takes a few seconds.
 
 Per cell the report shows PCI, SSB frequency, GSCN and ARFCN, the SSB indices (beams)
 received with their SS-RSRP, SS-SINR, frequency offset, and the MIB: SFN, half frame,
@@ -189,14 +205,30 @@ How it works:
 1. **PSS search.** One FFT of the whole capture; for every GSCN and frequency-offset
    hypothesis the PSS sub-band is cut out of that spectrum (ideal decimation) and
    correlated with the three PSS m-sequences by a small IFFT.
-2. **SSS and SSB index.** Each PSS peak is cut out of the full-rate signal, shifted to
-   baseband and resampled to 512 × SCS. Timing and CFO are refined on the PSS (with the
-   data around the SSB filtered out) and on the DMRS phase. The SSS gives N_ID1 and the
-   PBCH DMRS (8 hypotheses) the 3 LSBs of the SSB index.
-3. **PBCH.** DMRS channel estimate (phase slope removed, then smoothed), equalization,
-   descrambling, repetition combining, polar SCL decoding (list 8, CRC24C) and the
-   38.212 payload de-interleaving/descrambling give the MIB. Below 3 GHz both
-   L_max = 4 and 8 interpretations are tried where the band allows them.
+   With two or more periods in the capture the correlation is also averaged over
+   periods (20 ms), and each averaged peak becomes a track of one block per period.
+2. **SSS and SSB index.** Each block is cut out of the full-rate signal, shifted to
+   baseband and resampled to 512 × SCS. The CFO is refined on the PSS halves summed
+   over the track (data around the SSB filtered out). The per-symbol phase of
+   TS 38.211 5.4 is removed: a gNB restarts the upconversion phase at every symbol, so
+   a receiver mixing the SSB to baseband sees −2π·f_SSB·t_l per symbol. Not removing it
+   looks like a CFO between symbols only, and can make the PSS and SSS channel
+   estimates cancel (at 3610.56 MHz neighbouring symbols differ by 90°). The SSS
+   (equalized with the smoothed PSS channel) gives N_ID1 and the PBCH DMRS (8
+   hypotheses, coherent on the PSS/SSS channel) the 3 LSBs of the SSB index, both
+   decided on the sum over the track.
+3. **PBCH.** DMRS channel estimate averaged over the three PBCH symbols and smoothed
+   (wider at low SNR), equalization, descrambling, repetition combining, polar SCL
+   decoding (list 8, CRC24C) and the 38.212 payload de-interleaving/descrambling give
+   the MIB. Below 3 GHz both L_max = 4 and 8 interpretations are tried where the band
+   allows them.
+4. **Soft combining.** Between blocks of one SSB index only the SFN, the half-frame bit
+   and the 38.212 scrambling that depends on them change. The coding is linear, so for
+   each hypothesis of the first block's SFN mod 16 and half frame (and, past a 16-frame
+   boundary, the carry into the MIB's SFN bits) the coded-bit difference is known and
+   the soft bits can be aligned and added. Hypotheses are ranked by how coherently
+   they add up, the best are decoded, and the CRC plus the SFN consistency decide. With
+   a weak SSS, the next best cell ids are tried as well.
 
 ## How it works
 
@@ -287,10 +319,10 @@ ltescan/
     search.py   SS/PBCH block search, demodulation, MIB decoding
     synth.py    gNB SSB burst generator
     report.py   NR text/JSON reports
-tests/          69 tests (unit, end-to-end on synthetic signals, Wireshark dissection)
+tests/          72 tests (unit, end-to-end on synthetic signals, Wireshark dissection)
 ```
 
-Tests: `pytest -q` (~45 s). The Wireshark tests run when `tshark` is installed.
+Tests: `pytest -q` (~55 s). The Wireshark tests run when `tshark` is installed.
 
 ## Verification and limitations
 
@@ -325,15 +357,21 @@ Tests: `pytest -q` (~45 s). The Wireshark tests run when `tshark` is installed.
 - a 20 MHz cell decoded from a 20 Msps capture;
 - co-channel cells resolved on the same carrier;
 - the receiver clock error (here +13 ppm) estimated and then corrected with `--ppm`;
-- 5G NR: MIB decoded from a non-standalone TDD cell in n38 (30 kHz SSB, k_SSB = 31)
-  and from two SSBs with CORESET#0 in n28 (15 kHz, L_max = 4).
+- 5G NR: MIB decoded from a non-standalone TDD cell in n38 (30 kHz SSB, k_SSB = 31),
+  from two SSBs with CORESET#0 in n28 (15 kHz, L_max = 4) and from an n78 cell
+  (100 MHz TDD carrier, 4 beams). The n78 cell is weak at the test location (no working
+  RF amplifier, SS-SINR around −4 dB) and decodes reliably only with soft combining over
+  a 0.3 s capture;
+- the 38.211 per-symbol phase: without compensation the live cells showed a 180°
+  PSS→SSS phase and inconsistent CFOs; with it the NR CFOs agree with LTE (≈ 0 ppm
+  after `--ppm`).
 
 Parts of the specification that the live tests did not exercise are checked only
 against the built-in generator, which shares the receiver's reading of the
 specification:
 
 - LTE TDD (at the test location band 38 carries only NR);
-- NR in n78 (no signal at the test location) and L_max = 64 (FR2, not supported);
+- NR L_max = 64 (FR2, not supported);
 - extended PHICH duration and extended CP;
 - distributed VRB allocation and DCI 1C;
 - PDSCH RE exclusions around PSS/SSS/PBCH for 25-RB cells;

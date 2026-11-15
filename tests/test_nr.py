@@ -70,9 +70,56 @@ def test_pbch_decodes_at_low_snr():
     assert pbch.pbch_decode(llr / sig ** 2, 98, 2, 8) is None      # wrong PCI
 
 
+def test_combine_across_sfn_boundary():
+    """Six blocks 20 ms apart, each too weak alone, crossing a 16-frame
+    boundary (the MIB SFN bits change: carry hypothesis)."""
+    rng = np.random.default_rng(11)
+    n_id, bar, sfn0 = 77, 2, 16 * 37 + 12             # 37 = 0b100101: one trailing 1
+    sig = np.sqrt(10 ** (12 / 10) / 2)                 # SNR -12 dB per RE
+    llrs, single = [], 0
+    for k in range(6):
+        m = pbch.Mib(sfn0 + 2 * k, 0, 30000, 6, 2, 12, 0, False, True, bar, 8)
+        s = pbch.pbch_symbols(m, n_id)
+        r = s + sig * (rng.normal(size=432) + 1j * rng.normal(size=432))
+        llr = np.empty(864)
+        llr[0::2], llr[1::2] = r.real, r.imag
+        llrs.append(llr * 2 * np.sqrt(2) / (2 * sig ** 2))
+        single += pbch.pbch_decode(llrs[-1], n_id, bar, 8) is not None
+    assert single <= 1
+    r = pbch.combine_decode(llrs, [0, 4, 8, 12, 16, 20], n_id, bar, 8, n_try=300)
+    assert r is not None
+    mib, n = r
+    assert (mib.sfn, mib.ssb_index, mib.k_ssb, mib.coreset0, n) == (sfn0, 2, 6, 12, 6)
+
+
+def test_symbol_phase_compensation():
+    """A gNB restarts the upconversion phase every symbol (38.211 5.4): with
+    an SSB at 3610.56 MHz neighbouring symbols differ by 90 degrees. The
+    receiver must remove that, or the PSS/SSS channels cancel."""
+    from ltescan.nr import search as S
+    f_ref = gscn_to_freq(7923)
+    cfg = NrSynthConfig(n_id=703, ssb_indices=(1,), carrier_sc=0)
+    y = generate(cfg, 0.025, 20e6, 1.5e6, f_ref)
+    pk = max(S.pss_search(y, 20e6, f_ref - 1.5e6, [7923], 30000, 15e3), key=lambda p: p.metric)
+    o = S._sync_track([S._demod_occ(y, 20e6, f_ref - 1.5e6, pk, 30000)], 30000)[0]
+    hp = o.grid[0, 56:183] * pbch.pss(1)
+    hs = o.grid[2, 56:183] * pbch.sss(703)
+    assert abs(np.angle(np.sum(hs * np.conj(hp)))) < 0.1
+
+
+def test_search_weak_cell_soft_combining():
+    """-9 dB: no single PBCH decodes, the track's ten blocks combined do."""
+    cfg = NrSynthConfig(n_id=703, scs=30000, l_max=8, ssb_indices=(1,), sfn0=1000)
+    cells, _, _ = _cells(cfg, 7923, 2e6, snr=-9, cfo=-6e3, duration=0.2, taps=1)
+    c = [c for c in cells if c.n_id == 703][0]
+    assert c.confirmed and c.mib.ssb_index == 1 and c.mib.sfn % 2 == 0
+    assert max(o.combined for o in c.obs) >= 5
+    assert abs(c.cfo + 6e3) < 1500
+
+
 def _cells(cfg, gscn, f_off, snr=6, cfo=15e3, duration=0.045, taps=3):
     f_ref = gscn_to_freq(gscn)
-    y = channel(generate(cfg, duration, 20e6, f_off)[None, :], 20e6, snr_db=snr, cfo=cfo,
+    y = channel(generate(cfg, duration, 20e6, f_off, f_ref)[None, :], 20e6, snr_db=snr, cfo=cfo,
                 delay=4321, taps=taps, seed=1)
     return ssb_search(y, 20e6, f_ref - f_off), y, f_ref - f_off
 

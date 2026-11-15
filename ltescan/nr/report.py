@@ -23,9 +23,11 @@ def cell_text(c: NrCell) -> str:
     if m is None:
         L.append("MIB: not decoded (PBCH CRC failed) - cell not confirmed")
         return "\n".join(L)
+    comb = max((o.combined for o in c.obs if o.mib), default=1)
     L.append(f"MIB: SFN {m.sfn}, half frame {m.half_frame}, SSB index {m.ssb_index}, "
              f"subCarrierSpacingCommon {m.scs_common // 1000} kHz, "
-             f"dmrs-TypeA-Position pos{m.dmrs_type_a_pos}")
+             f"dmrs-TypeA-Position pos{m.dmrs_type_a_pos}"
+             + (f" (soft-combined from {comb} blocks)" if comb > 1 else ""))
     L.append(f"     k_SSB {m.k_ssb}, controlResourceSetZero {m.coreset0}, "
              f"searchSpaceZero {m.search_space0}, "
              f"cellBarred: {'barred' if m.cell_barred else 'notBarred'}, "

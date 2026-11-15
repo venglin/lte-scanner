@@ -394,11 +394,12 @@ def cmd_nr(a):
                          cfo_max=a.cfo_max, log=log))
     else:
         fs = a.rate
+        dur = a.duration or 0.045
         plan = _nr_plan(a, fs)
         src = open_source(a)
         for i, (fc, scs, grp) in enumerate(plan):
-            log(f"capturing {a.duration:.3f} s @ {fc / 1e6:.3f} MHz, {fs / 1e6:.2f} Msps ...")
-            cap = src.capture(fc, fs, int(a.duration * fs), bb_filter=0.75 * fs)
+            log(f"capturing {dur:.3f} s @ {fc / 1e6:.3f} MHz, {fs / 1e6:.2f} Msps ...")
+            cap = src.capture(fc, fs, int(dur * fs), bb_filter=0.75 * fs)
             found = ssb_search(cap.x, cap.fs, fc, scs=scs, gscns=grp, cfo_max=a.cfo_max,
                                log=None if a.band else log)
             merge(found)
@@ -546,8 +547,9 @@ def build_parser():
     s.add_argument("--scs", type=int, choices=[15, 30],
                    help="SSB subcarrier spacing [kHz] (default: from the band)")
     s.add_argument("--rate", type=float, default=20e6, help="sample rate (default 20 Msps)")
-    s.add_argument("--duration", type=float, default=0.045,
-                   help="capture length [s] (default 0.045 = two 20 ms SSB periods)")
+    s.add_argument("--duration", type=float, default=None,
+                   help="capture length [s] (default 0.045 = two 20 ms SSB periods; with "
+                        "--file the whole file). Weak cells: 0.2-0.4 (soft combining)")
     s.add_argument("--cfo-max", type=float, default=None,
                    help="CFO search range [Hz] (default: 20 ppm of the frequency)")
     s.add_argument("--all", action="store_true",

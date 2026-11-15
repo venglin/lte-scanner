@@ -222,6 +222,60 @@ def pbch_decode(llr: np.ndarray, n_id: int, ssb_bar: int, l_max: int,
     return payload_decode(bits, n_id, ssb_bar, l_max)
 
 
+def combine_decode(llrs: list[np.ndarray], half_frames: list[int], n_id: int, ssb_bar: int,
+                   l_max: int, list_size: int = 8, n_try: int = 4):
+    """Soft-combine the PBCHs of one SSB received in several (half) frames.
+
+    Between those blocks only the SFN and the half-frame bit of the payload
+    change (and with them the 38.212 scrambling); the 38.211 scrambling is
+    the same for the same SSB index. The payload coding is linear, so for a
+    hypothesis of the first block's SFN mod 16 and half frame the difference
+    of the coded bits is known and the soft bits can be aligned and added.
+    Blocks after a 16-frame boundary also change the 6 SFN bits of the MIB:
+    the carry pattern (number of trailing ones of SFN >> 4) is one more
+    hypothesis. Blocks beyond a second boundary are left out.
+    half_frames[k] = half frames between block 0 and block k.
+    All hypotheses are first ranked by how coherently the aligned soft bits
+    add up (normalised energy of the sum); only the best `n_try` are
+    decoded. Returns (Mib of block 0, number of blocks combined) or None."""
+
+    def coded(sfn, hf):
+        m = Mib(sfn % 1024, hf, 15000, 0, 2, 0, 0, False, True, ssb_bar, l_max)
+        return payload_encode(m, n_id)
+
+    hyps = []
+    hfs = [ssb_bar >> 2] if l_max == 4 else [0, 1]
+    for hf0 in hfs:
+        for s0 in range(16):
+            blocks = []
+            for llr, dh in zip(llrs, half_frames):
+                h = hf0 + dh
+                f, hf = s0 + h // 2, h % 2
+                if f < 32 and not (l_max == 4 and hf != hf0):
+                    blocks.append((f, hf, llr))
+            if len(blocks) < 2:
+                continue
+            energy = sum(float(np.dot(b[2], b[2])) for b in blocks)
+            carries = range(7) if max(b[0] for b in blocks) >= 16 else [None]
+            for t in carries:
+                m_lo = 0 if t is None else (1 << t) - 1
+                base = coded(16 * m_lo + s0, hf0)
+                acc = np.zeros(PBCH_E)
+                for f, hf, llr in blocks:
+                    e = polar.encode(base ^ coded(16 * m_lo + f, hf), PBCH_N, PBCH_E)
+                    acc += llr * (1 - 2 * e.astype(np.float64))
+                hyps.append((float(np.dot(acc, acc)) / energy, s0, hf0, t, acc, len(blocks)))
+    hyps.sort(key=lambda h: -h[0])
+    for _, s0, hf0, t, acc, n in hyps[:n_try]:
+        m = pbch_decode(acc, n_id, ssb_bar, l_max, list_size)
+        if not m or m.sfn % 16 != s0 or m.half_frame != hf0:
+            continue
+        if t is not None and ((m.sfn >> 4) & ((2 << t) - 1)) != (1 << t) - 1:
+            continue
+        return m, n
+    return None
+
+
 def ssb_grid(n_id: int, m: Mib, beta_pss: float = 1.0) -> np.ndarray:
     """(4, 240) complex resource grid of one SS/PBCH block."""
     g = np.zeros((4, 240), dtype=complex)
