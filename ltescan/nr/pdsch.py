@@ -192,10 +192,17 @@ class Allocation:
                 if not (l in self.dmrs and cdm_groups_without_data(self.length) == 2)]
 
 
-def allocation(dci: Dci10Si, type_a_pos: int) -> Allocation | None:
+def allocation(dci: Dci10Si, type_a_pos: int, tdra_list: list | None = None) -> Allocation | None:
+    """tdra_list: pdsch-TimeDomainAllocationList of SIB1 [(K0, mapping, S, L)],
+    which replaces default table A outside the Type0-PDCCH CSS."""
     if dci.mcs >= len(MCS_TABLE1):
         return None
-    mapping, k0, s, length = tdra(dci.tdra, type_a_pos)
+    if tdra_list:
+        if dci.tdra >= len(tdra_list):
+            return None
+        k0, mapping, s, length = tdra_list[dci.tdra]
+    else:
+        mapping, k0, s, length = tdra(dci.tdra, type_a_pos)
     if k0 != 0:
         return None
     start, n = dci.rb_start_len

@@ -9,9 +9,11 @@ channels. It is not a full 3GPP stack.
   and soft combining that decodes weak cells down to about −10 dB SNR. **SIB1**:
   Type0-PDCCH on CORESET#0, LDPC-coded PDSCH, PLMNs, TAC, NR cell identity, SI
   scheduling, and the carrier position and bandwidth (e.g. a 100 MHz n78 carrier).
+  **SI messages** (SIB2, SIB3, …) in their SI-windows, with the SIB2 reselection
+  parameters in the report and everything in full through Wireshark.
 - **LTE:** cell search, MIB, PDCCH blind decoding, turbo-coded PDSCH, SIB1 (PLMN, TAC,
   Cell ID), random access responses, paging, and live export to Wireshark.
-- Built-in eNB and gNB signal generators, 88 tests, and live verification on four
+- Built-in eNB and gNB signal generators, 92 tests, and live verification on four
   Polish operators' networks.
 
 The 20 MHz HackRF is enough for NR too: an SS/PBCH block occupies 7.2 MHz even when
@@ -32,8 +34,9 @@ the carrier is 100 MHz wide (see [5G NR](#5g-nr)).
 | DCI 1_0 (SI-RNTI) | polar code with puncturing, shortening and repetition, CRC24C with RNTI mask; frequency (RIV) and time domain allocation, VRB-to-PRB interleaving, MCS, RV |
 | PDSCH → **SIB1** | default time allocation table A, DMRS type 1 with additional positions, rate matching around SS/PBCH blocks, QPSK/16QAM/64QAM, TBS (38.214), **LDPC** (both base graphs, segmentation, rate matching, layered min-sum decoder), CRC16/24A |
 | Weak SIB1 | PDSCH repetitions (any redundancy versions) soft-combined in the LDPC buffer; PDCCHs soft-combined over the occasions of a beam (RV differences aligned through the linearity of the code) and a decoded DCI matched in the other occasions |
-| RRC (ASN.1 UPER) | **SIB1**: PLMNs (MCC-MNC), TAC, RANAC, NR cell identity, cell reservation, q-RxLevMin/q-QualMin, connection establishment failure control, SI scheduling (SIB types, periodicity, window), frequency bands, offsetToPointA, carriers per SCS (position, bandwidth) |
-| Wireshark | MIB and SIB1 to a pcap file for Wireshark's NR RRC dissector (`--pcap`) |
+| SI messages | SI-windows from the SIB1 schedule (38.331 5.2.2.3.2), searchSpaceOtherSystemInformation (monitoring slots, symbols, candidates) or every window slot, DCI 1_0 with SI indicator 1 on CORESET#0, the SIB1 pdsch-TimeDomainAllocationList, DMRS referenced to point A, PDCCH combining over windows, DCI matching and PDSCH combining per message |
+| RRC (ASN.1 UPER) | **SIB1**: PLMNs (MCC-MNC), TAC, RANAC, NR cell identity, cell reservation, q-RxLevMin/q-QualMin, connection establishment failure control, SI scheduling (SIB types, periodicity, window), frequency bands, offsetToPointA, carriers per SCS (position, bandwidth), initial BWP (common search spaces and CORESET, SIB1/OSI/paging/RA search space ids, PDSCH time domain allocation list); **SystemInformation**: contained SIBs, SIB2 head (q-Hyst, priority, thresholds, q-RxLevMin, s-IntraSearchP, t-ReselectionNR) |
+| Wireshark | MIB, SIB1 and SI messages to a pcap file for Wireshark's NR RRC dissector (`--pcap`) |
 
 ### LTE
 
@@ -97,6 +100,7 @@ Without a HackRF, every command works on IQ files (`--file`).
 ltescan nr --band n78 --ppm 13 --lna 40 --vga 40     # scan a whole band
 ltescan nr --gscn 7880 --duration 0.3                # one raster entry, weak cell
 ltescan nr --gscn 1902 --sib1 --pcap sib1.pcap       # + SIB1, also for Wireshark
+ltescan nr --gscn 1902 --si                          # + SIB1 and the SI messages
 ltescan nr --file n78.cs8 --sib1 --json nr.json      # offline
 ```
 
@@ -216,10 +220,11 @@ thresholds and priorities, inter-frequency neighbours, and so on.
 | `--no-rar` | do not decode random access responses |
 
 With `--pcap -` all text output goes to stderr, so stdout carries only the pcap stream.
-For NR, `ltescan nr --sib1 --pcap FILE` writes the MIB and SIB1 of every cell as NR RRC
-messages (BCCH-BCH and BCCH-DL-SCH), which Wireshark decodes in full, including the
-parts of SIB1 that the built-in report does not show (servingCellConfigCommon, TDD
-pattern, timers, barring).
+For NR, `ltescan nr --sib1 --pcap FILE` (or `--si`) writes the MIB, SIB1 and SI
+messages of every cell as NR RRC messages (BCCH-BCH and BCCH-DL-SCH), which Wireshark
+decodes in full, including the parts the built-in report does not show
+(servingCellConfigCommon, TDD pattern, timers, barring, SIB3 neighbours, SIB4/SIB5
+inter-frequency and LTE carriers).
 On Windows give Wireshark's full path if it is not on `PATH`:
 `... --pcap - | "C:\Program Files\Wireshark\Wireshark.exe" -k -i -`.
 
@@ -322,7 +327,10 @@ contain it (the report says where to tune if it does not).
    default time domain table A, VRB-to-PRB interleaving, MCS (64QAM table) and RV.
    The DMRS (type 1, port 1000, front-loaded plus the pos2 additional positions, no
    data in DMRS symbols, 3 dB boosted) gives the channel; PRBs that carry an SS/PBCH
-   block in the same symbols are skipped. After demapping and descrambling (SI-RNTI)
+   block in the same symbols are skipped. Subcarriers whose power is far above their
+   neighbours' (receiver spurs: a live HackRF capture had a strong comb on every 4th
+   subcarrier) are treated as erasures; their confident, repeatable wrong soft bits
+   would otherwise survive any amount of combining. After demapping and descrambling (SI-RNTI)
    the LDPC chain of 38.212 (base graph selection, code block segmentation, filler
    bits, rate recovery per RV, layered normalised min-sum decoding with a parity check)
    and the transport block CRC give the BCCH-DL-SCH message.
@@ -338,6 +346,28 @@ contain it (the report says where to tune if it does not).
 8. **RRC.** The SIB1 is parsed (ASN.1 UPER) up to frequencyInfoDL. With offsetToPointA
    and the SCS-specific carrier list this gives point A and the actual carrier:
    position, number of PRBs and the channel bandwidth.
+
+### SI messages
+
+`--si` (implies `--sib1`) also receives the SI messages that SIB1 schedules. SI message
+n (its position in schedulingInfoList) is sent in an SI-window of si-WindowLength slots
+that starts in the frame with SFN mod T = ⌊x/N⌋, slot x mod N, where x = (n − 1) ·
+si-WindowLength, T is its si-Periodicity and N the number of slots per frame. Live,
+one more capture covers the longest period (`--si-max-duration`, default 1 s; e.g.
+340 ms for a 320 ms period). When SIB1 names a searchSpaceOtherSystemInformation, only
+its monitoring slots and symbols (with its candidate numbers) are searched; otherwise
+every slot of the window, until a DCI shows up (later windows then only at the same
+window slots). The PDCCH is DCI 1_0 with SI-RNTI and SI indicator 1 on CORESET#0. Two
+rules differ from SIB1 (Type0 CSS): the time domain allocation comes from SIB1's
+pdsch-TimeDomainAllocationList when present, and the PDSCH DMRS sequence starts at
+common RB 0 (point A, known from SIB1) instead of at CORESET#0. The transmissions of a
+message are matched and soft-combined like SIB1. The report lists the SIBs of each message (from the SIB1
+mapping, checked against the first element) and the head of SIB2. SIBs are not open
+types in the SystemInformation encoding, so listing the rest needs a full parser of
+every SIB: Wireshark does that from the `--pcap` export.
+
+SI messages in a search space on another CORESET (`commonControlResourceSet`) are not
+received; the cells seen so far use CORESET#0.
 
 On synthetic signals a SIB1 with MCS 2 decoded from a single transmission at 1 dB
 PDSCH SINR, and with PDCCH and PDSCH combining over 0.3 s at −8 dB. Live, `--sib1`
@@ -434,11 +464,11 @@ ltescan/
     pdsch.py    time/frequency allocation, DMRS, MCS, TBS, QAM (de)mapping
     ldpc.py     LDPC: segmentation, encoder, rate matching, min-sum decoder
     ldpc_tables.py  base graphs BG1/BG2
-    sib1.py     SIB1 receiver: frame timing, occasions, PDCCH/PDSCH, combining
-    rrc.py      ASN.1 UPER: NR SIB1
-    synth.py    gNB generator: SSB bursts, SIB1 PDCCH + PDSCH
+    sib1.py     SIB1 and SI receiver: frame timing, occasions, SI-windows, combining
+    rrc.py      ASN.1 UPER: NR SIB1, SystemInformation, SIB2 head
+    synth.py    gNB generator: SSB bursts, SIB1 and SI messages (PDCCH + PDSCH)
     report.py   NR text/JSON reports
-tests/          88 tests (unit, end-to-end on synthetic signals, Wireshark dissection)
+tests/          92 tests (unit, end-to-end on synthetic signals, Wireshark dissection)
 ```
 
 Tests: `pytest -q` (1–2 min). The Wireshark tests run when `tshark` is installed.
@@ -488,11 +518,14 @@ Tests: `pytest -q` (1–2 min). The Wireshark tests run when `tshark` is install
   PSS→SSS phase and inconsistent CFOs; with it the NR CFOs agree with LTE (≈ 0 ppm
   after `--ppm`);
 - 5G NR SIB1 decoded from two n28 carriers (15 kHz, CORESET#0 of 24 RB × 2 symbols,
-  MCS 0, a 5 MHz and a 10 MHz carrier, one of them shared by two PLMNs). The same
-  SIB1, exported with `--pcap`, is decoded by Wireshark's NR RRC dissector without
-  errors and with the same values. The weak n78 cell shows no Type0-PDCCH even after
-  combining (it is barred and may not broadcast SIB1), so the 30 kHz SIB1 path is
-  verified only on synthetic signals.
+  MCS 0, a 5 MHz and a 10 MHz carrier, one of them shared by two PLMNs), and from a
+  standalone n78 cell of another operator (30 kHz, 100 MHz carrier) at about −3 dB
+  PDSCH SINR, together with its two SI messages (SIB2+SIB4 and SIB5: a type A
+  allocation from the SIB1 list, search space 8 on CORESET#0). Exported with `--pcap`,
+  all of them are decoded by Wireshark's NR RRC dissector without errors and with the
+  same values as the built-in report (SIB4 lists the NR inter-frequency carriers,
+  SIB5 the LTE ones). The weak barred n78 cell shows no Type0-PDCCH even after
+  combining; it probably does not broadcast SIB1.
 
 Parts of the specification that the live tests did not exercise are checked only
 against the built-in generator, which shares the receiver's reading of the
@@ -516,8 +549,9 @@ Other limitations:
 - not real time: about 4–6 ms per subframe with numba (see Performance), so `monitor`
   works in bursts with gaps;
 - RSRP is reported in dBFS. A value in dBm needs calibration of the receive chain;
-- NR: SS/PBCH block, MIB and SIB1 only (no other SI messages, no user data); FR1
-  only, SS/PBCH-CORESET multiplexing pattern 1, bands with a 5/10 MHz minimum channel
+- NR: SS/PBCH block, MIB, SIB1 and SI messages on CORESET#0 (no paging, no user
+  data); the built-in report names the SIBs of an SI message and shows only the head
+  of SIB2; FR1 only, SS/PBCH-CORESET multiplexing pattern 1, bands with a 5/10 MHz minimum channel
   bandwidth (the CORESET#0 tables of n79/n104 are not included); the built-in SIB1
   report stops after frequencyInfoDL (the rest is in the Wireshark export).
 

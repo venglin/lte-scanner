@@ -10,7 +10,7 @@ from ltescan.nr.ldpc_tables import BG1, BG2
 from ltescan.nr.params import gscn_to_freq
 from ltescan.nr.pbch import Mib
 from ltescan.nr.search import ssb_search
-from ltescan.nr.sib1 import decode_sib1
+from ltescan.nr.sib1 import decode_si, decode_sib1
 from ltescan.nr.synth import NrSynthConfig, generate
 from ltescan.sdr import write_iq
 from ltescan.synth import channel
@@ -198,3 +198,74 @@ def test_sib1_pdcch_combining_and_matching():
     assert r.error is None and r.sib1.plmns == ["260-03"]
     assert not any(d.how == "decoded" for d in r.dcis)
     assert any(d.how == "combined" for d in r.dcis) and r.combined >= 8
+
+
+def test_si_rrc_roundtrip():
+    b = rrc.NrSib2(6, 3, 6, 12, -118, 31, 2)
+    kind, si = rrc.decode_bcch_dlsch(rrc.encode_si(b, n_sibs=2))
+    assert kind == "SI" and si.n_sibs == 2 and si.first == "SIB2" and si.sib2 == b
+    kind, si = rrc.decode_bcch_dlsch(rrc.encode_si(first="SIB4"))
+    assert si.first == "SIB4" and si.sib2 is None
+    s = rrc.decode_bcch_dlsch(rrc.encode_sib1("001", "01", 1, 2, 78, 0, 30, 273,
+                                              si=[(16, ["SIB2"]), (64, ["SIB4", "SIB5"])],
+                                              si_window=20))[1]
+    assert s.si == [(16, ["SIB2"]), (64, ["SIB4", "SIB5"])] and s.si_window_slots == 20
+
+
+def _si_cell(osi: bool):
+    """Two SI messages (160 and 320 ms) in their SI-windows. With osi the
+    SIB1 also carries searchSpaceOtherSystemInformation (slot 9 of every 10)
+    and a pdsch-TimeDomainAllocationList used by the SI PDSCH (whose DMRS
+    then starts at point A)."""
+    ss = rrc.SearchSpace(8, 0, 10, 9, None, [0], {4: 4, 8: 2, 16: 1}) if osi else None
+    tdra = [(0, "A", 2, 12), (0, "A", 2, 5)] if osi else None
+    sib1 = rrc.encode_sib1("001", "01", 0x123, 0xABC001, 78, 244, 30, 273,
+                           si=[(16, ["SIB2", "SIB3"]), (32, ["SIB4"])], si_window=10,
+                           osi_ss=ss, pdsch_tdra=tdra)
+    si1 = rrc.encode_si(rrc.NrSib2(6, 3, 6, 12, -118, 31, 2), n_sibs=2, pad=20)
+    si2 = rrc.encode_si(first="SIB4", pad=30)
+    # CORESET#0 starts at common RB 244 / 2 - 12 = 110 (SI DMRS reference)
+    extra = dict(si_slots=(9,), si_tdra=1, si_tdra_list=tuple(tdra), si_rbs=(0, 36),
+                 si_mcs=2) if osi else {}
+    cfg = NrSynthConfig(n_id=703, ssb_indices=(0, 1, 2, 3), k_ssb=22, coreset0=10,
+                        search_space0=9, sib1=sib1, sfn0=500, carrier_sc=600, si=(si1, si2),
+                        si_periods=(16, 32), si_coreset0_crb=110, **extra)
+    return cfg, si1, si2
+
+
+def test_si_whole_windows():
+    """No search space in SIB1: every slot of the SI-windows is searched."""
+    cfg, si1, si2 = _si_cell(False)
+    y, fc, cell = _capture(cfg, 7923, 6, 0.35)
+    r = decode_sib1(y, 20e6, fc, cell)
+    msgs = decode_si(y, 20e6, fc, cell, r)
+    assert [m.payload is not None for m in msgs] == [True, True]
+    assert msgs[0].info.sib2.cell_reselection_priority == 6 and msgs[1].info.first == "SIB4"
+
+
+def test_cli_nr_si_messages(tmp_path, capsys):
+    """searchSpaceOtherSystemInformation and the SIB1 time allocation list;
+    report, JSON and pcap."""
+    cfg, si1, si2 = _si_cell(True)
+    y, fc, _ = _capture(cfg, 7923, 6, 0.35)
+    f = tmp_path / "si.cs8"
+    write_iq(f, y, 20e6, fc)
+    assert main(["nr", "--file", str(f), "--si", "--cfo-max", "5000",
+                 "--json", str(tmp_path / "nr.json"), "--pcap", str(tmp_path / "nr.pcap")]) == 0
+    out = capsys.readouterr().out
+    assert "SI 1 (SIB2+SIB3, every 160 ms): decoded" in out and "36 PRB" in out
+    assert "SIB2: q-Hyst 6 dB, cellReselectionPriority 6" in out
+    assert "SI 2 (SIB4, every 320 ms): decoded" in out
+    assert '"first_sib": "SIB4"' in (tmp_path / "nr.json").read_text()
+    pc = (tmp_path / "nr.pcap").read_bytes()
+    assert si1[:20] in pc and si2[:20] in pc
+
+
+def test_spur_subcarriers_erased():
+    """A strong comb on every 4th subcarrier (receiver spur) is detected."""
+    from ltescan.nr.sib1 import _spur_subcarriers
+    rng = np.random.default_rng(0)
+    g = (rng.normal(size=(14, 576)) + 1j * rng.normal(size=(14, 576))) / np.sqrt(2)
+    g[:, ::4] += 3
+    sp = _spur_subcarriers(g, [2, 3, 4, 5, 6], list(range(36)))
+    assert sp == set(range(0, 432, 4))

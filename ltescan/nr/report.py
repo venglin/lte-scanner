@@ -131,7 +131,68 @@ def sib1_text(r) -> str:
                  + ("; " + "; ".join(car) if car else ""))
     if not s.complete:
         L.append("(rest of SIB1 not parsed: si-RequestConfig present)")
+    L += si_lines(r.si)
     return "\n".join("     " + x if i else x for i, x in enumerate(L))
+
+
+def si_lines(msgs) -> list[str]:
+    out = []
+    for m in msgs:
+        head = f"SI {m.index} ({'+'.join(m.sibs)}, every {m.period * 10} ms): "
+        if m.payload is None:
+            out.append(head + f"not decoded - {m.error}"
+                       + (f" ({m.windows} window(s), {m.slots_tried} slots)" if m.windows else ""))
+            continue
+        a = m.alloc
+        mod = {2: "QPSK", 4: "16QAM", 6: "64QAM"}[a.qm]
+        rv = ",".join(map(str, m.rvs)) if len(m.rvs) <= 4 else \
+            "/".join(map(str, sorted(set(m.rvs))))
+        out.append(head + f"decoded from {m.combined} transmission(s) (RV {rv}), MCS {a.dci.mcs} "
+                   f"{mod}, {len(a.prbs)} PRB, TBS {a.tbs} bits, PDSCH SINR {m.pdsch_sinr_db:.1f} dB")
+        info = m.info
+        if info is None:
+            if m.error:
+                out.append("  " + m.error)
+            continue
+        if info.first != (m.sibs[0] if m.sibs else info.first):
+            out.append(f"  first element {info.first} (SIB1 maps {'+'.join(m.sibs)})")
+        b = info.sib2
+        if b is not None:
+            out.append(f"  SIB2: q-Hyst {b.q_hyst_db} dB, cellReselectionPriority "
+                       f"{b.cell_reselection_priority}, threshServingLowP "
+                       f"{2 * b.thresh_serving_low_p} dB"
+                       + (f", s-NonIntraSearchP {2 * b.s_non_intra_search_p} dB"
+                          if b.s_non_intra_search_p is not None else "")
+                       + f", q-RxLevMin {b.q_rx_lev_min} dBm, s-IntraSearchP "
+                       f"{2 * b.s_intra_search_p} dB, t-ReselectionNR {b.t_reselection_nr} s")
+    if msgs and any(m.payload for m in msgs):
+        out.append("  (full SIB contents: --pcap and Wireshark)")
+    return out
+
+
+def si_dict(m) -> dict:
+    d = {"index": m.index, "period_frames": m.period, "sibs": m.sibs, "decoded": m.payload is not None,
+         "error": m.error, "windows": m.windows, "dci_count": len(m.dcis)}
+    if m.alloc is not None:
+        a = m.alloc
+        d["pdsch"] = {"mcs": a.dci.mcs, "qm": a.qm, "n_prb": len(a.prbs), "tbs": a.tbs,
+                      "transmissions": m.combined}
+    if m.payload is not None:
+        d["payload_hex"] = m.payload.hex()
+    if m.info is not None:
+        d["n_sibs"] = m.info.n_sibs
+        d["first_sib"] = m.info.first
+        b = m.info.sib2
+        if b is not None:
+            d["sib2"] = {"q_hyst_db": b.q_hyst_db, "cell_reselection_priority":
+                         b.cell_reselection_priority, "thresh_serving_low_p_db":
+                         2 * b.thresh_serving_low_p,
+                         "s_non_intra_search_p_db": None if b.s_non_intra_search_p is None
+                         else 2 * b.s_non_intra_search_p,
+                         "q_rx_lev_min_dbm": b.q_rx_lev_min,
+                         "s_intra_search_p_db": 2 * b.s_intra_search_p,
+                         "t_reselection_nr_s": b.t_reselection_nr}
+    return d
 
 
 def sib1_dict(r) -> dict:
@@ -149,6 +210,8 @@ def sib1_dict(r) -> dict:
                         "sinr_db": None if r.pdsch_sinr_db is None else round(r.pdsch_sinr_db, 1)}
     if r.payload is not None:
         out["payload_hex"] = r.payload.hex()
+    if r.si:
+        out["si_messages"] = [si_dict(m) for m in r.si]
     s = r.sib1
     if s is not None:
         out["plmn_info"] = [{"plmns": [f"{m}-{n}" if m else n for m, n in pi.plmns],

@@ -44,6 +44,17 @@ class NrSynthConfig:
     sib1_level: int = 8
     sib1_interleaved: bool = False
     sib1_rvs: tuple = (0, 2, 3, 1)
+    # SI messages (BCCH-DL-SCH payloads) in their SI-windows; the schedule
+    # must match the one in the SIB1 payload
+    si: tuple = ()                   # payload per SI message n = 1, 2, ...
+    si_periods: tuple = (16,)        # si-Periodicity [frames] per message
+    si_window: int = 10              # si-WindowLength [slots]
+    si_slots: tuple = (1, 5)         # transmissions at these window slots
+    si_mcs: int = 4
+    si_rbs: tuple = (0, 24)
+    si_coreset0_crb: int = 0         # common RB of CORESET#0 (SI DMRS start at point A)
+    si_tdra: int = 0                 # DCI time domain field of the SI messages
+    si_tdra_list: tuple = ()         # pdsch-TimeDomainAllocationList (as in SIB1)
 
     def mib(self, sfn: int, ssb_index: int) -> Mib:
         return Mib(sfn=sfn, half_frame=0, scs_common=self.scs, k_ssb=self.k_ssb,
@@ -123,8 +134,34 @@ class _Sib1Tx:
         if a is None or a.tbs < 8 * len(cfg.sib1):
             raise ValueError(f"SIB1 of {len(cfg.sib1)} bytes does not fit "
                              f"(TBS {a.tbs if a else 0})")
-        pad = bytes(a.tbs // 8 - len(cfg.sib1))
-        self.tb = np.unpackbits(np.frombuffer(cfg.sib1 + pad, dtype=np.uint8))
+        self.tb = self._tb(cfg.sib1, a.tbs)
+        self.si = []                 # (dci template, TB bits, transmissions so far)
+        for n, payload in enumerate(cfg.si):
+            st, ln = cfg.si_rbs
+            d = pdcch.Dci10Si(self.c0.n_rb, pdcch.riv(self.c0.n_rb, st, ln), cfg.si_tdra, False,
+                              cfg.si_mcs, 0, 1)
+            a = pdsch.allocation(d, cfg.dmrs_type_a_pos, list(cfg.si_tdra_list) or None)
+            self.si.append([d, self._tb(payload, a.tbs), 0])
+
+    @staticmethod
+    def _tb(payload: bytes, tbs: int) -> np.ndarray:
+        if tbs < 8 * len(payload):
+            raise ValueError(f"payload of {len(payload)} bytes does not fit (TBS {tbs})")
+        pad = bytes(tbs // 8 - len(payload))
+        return np.unpackbits(np.frombuffer(payload + pad, dtype=np.uint8))
+
+    def _si_message(self, sfn: int, slot: int) -> int | None:
+        """Index of the SI message transmitted in this slot (38.331 5.2.2.3.2)."""
+        cfg = self.cfg
+        nsl = 10 * 2 ** self.c0.mu
+        for n in range(len(cfg.si)):
+            per = cfg.si_periods[n % len(cfg.si_periods)]
+            xw = n * cfg.si_window
+            for j in cfg.si_slots:
+                s = xw % nsl + j
+                if s % nsl == slot and (sfn - s // nsl) % per == (xw // nsl) % per:
+                    return n
+        return None
 
     def _ssb_blocked(self, slot: int) -> set:
         """(symbol, PRB) of the SSBs of this slot (first half frame)."""
@@ -138,15 +175,21 @@ class _Sib1Tx:
                     out |= {(l, p) for p in prbs}
         return out
 
-    def _build(self, frame: int, slot: int, sym0: int):
+    def _build(self, frame: int, slot: int, sym0: int, si: int | None = None):
         cfg = self.cfg
         c0 = self.c0
         n_id = cfg.n_id
         g = np.zeros((14, c0.n_sc), dtype=complex)
         own = np.zeros((14, c0.n_sc), dtype=bool)
-        rv = cfg.sib1_rvs[self.count % len(cfg.sib1_rvs)]
-        self.count += 1
-        dci = replace(self.dci, rv=rv)
+        if si is None:
+            rv = cfg.sib1_rvs[self.count % len(cfg.sib1_rvs)]
+            self.count += 1
+            dci, tb = replace(self.dci, rv=rv), self.tb
+        else:
+            st = self.si[si]
+            rv = cfg.sib1_rvs[st[2] % len(cfg.sib1_rvs)]
+            st[2] += 1
+            dci, tb = replace(st[0], rv=rv), st[1]
         # PDCCH on the first candidate of the configured aggregation level
         cce, lv = next(c for c in pdcch.candidates(c0) if c[1] == cfg.sib1_level)
         ll, kk, rbs = pdcch.candidate_res(c0, n_id, cce, lv, sym0)
@@ -158,19 +201,21 @@ class _Sib1Tx:
                 g[l, 12 * rb + pdcch.DMRS_SC] = ref[rb]
                 own[l, 12 * rb:12 * rb + 12] = True
         # PDSCH (K0 = 0)
-        a = pdsch.allocation(dci, cfg.dmrs_type_a_pos)
+        a = pdsch.allocation(dci, cfg.dmrs_type_a_pos,
+                             list(cfg.si_tdra_list) or None if si is not None else None)
         blocked = self._ssb_blocked(slot) if (frame * 10) % cfg.period_ms == 0 else set()
         l_re, k_re = pdsch.data_res(a, blocked)
         gbits = len(l_re) * a.qm
-        bits = ldpc.dlsch_encode(self.tb, a.rate, a.qm, gbits, rv) ^ pdsch.scrambling(n_id, gbits)
+        bits = ldpc.dlsch_encode(tb, a.rate, a.qm, gbits, rv) ^ pdsch.scrambling(n_id, gbits)
         g[l_re, k_re] = pdsch.modulate(bits, a.qm)
         beta = np.sqrt(2) if pdsch.cdm_groups_without_data(a.length) == 2 else 1.0
+        crb0 = 0 if si is None else cfg.si_coreset0_crb
         for l in a.dmrs:
-            ref = pdsch.dmrs_seq(slot, l, n_id, c0.n_sc)
+            ref = pdsch.dmrs_seq(slot, l, n_id, c0.n_sc + 12 * crb0)
             for p in a.prbs:
                 if (l, p) not in blocked:
                     k = 12 * p + np.arange(0, 12, 2)
-                    g[l, k] = beta * ref[k // 2]
+                    g[l, k] = beta * ref[k // 2 + 6 * crb0]
         for l in range(a.s, a.s + a.length):
             for p in a.prbs:
                 if (l, p) not in blocked:
@@ -187,6 +232,10 @@ class _Sib1Tx:
                 if n0 == slot and sfn % 2 == parity:
                     self.slots[key] = self._build(frame, slot, sym0)
                     break
+            if self.slots[key] is None and self.si:
+                n = self._si_message(sfn, slot)
+                if n is not None:
+                    self.slots[key] = self._build(frame, slot, 0, n)
         v = self.slots[key]
         if v is None:
             return

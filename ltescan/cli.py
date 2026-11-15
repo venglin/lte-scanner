@@ -410,6 +410,8 @@ def cmd_nr(a):
                        or "-"))
     cells.sort(key=lambda c: (not c.confirmed, c.f_ref, -c.rsrp_dbfs))
     sib1 = {}
+    if a.si:
+        a.sib1 = True
     if a.sib1:
         sib1 = _nr_sib1(a, cells, x if a.file else None, fs, fc if a.file else None,
                         None if a.file else src)
@@ -451,13 +453,15 @@ def _nr_sib1(a, cells, x, fs, fc, src) -> dict:
     from a new capture centred on CORESET#0 (SSBs found again for timing)."""
     from .nr.pdcch import coreset0
     from .nr.search import ssb_search
-    from .nr.sib1 import Sib1Result, decode_sib1
+    from .nr.sib1 import Sib1Result, decode_si, decode_sib1
     out = {}
     for c in cells:
         if not c.confirmed or not c.mib.sib1_present:
             continue
         if src is None:
-            out[id(c)] = decode_sib1(x, fs, fc, c, log=log)
+            r = out[id(c)] = decode_sib1(x, fs, fc, c, log=log)
+            if a.si and r.sib1 is not None:
+                r.si = decode_si(x, fs, fc, c, r, log=log)
             continue
         c0 = coreset0(c.mib, c.f_ref, c.scs)
         if c0 is None:
@@ -478,12 +482,27 @@ def _nr_sib1(a, cells, x, fs, fc, src) -> dict:
             r.error = "cell not found again in the SIB1 capture"
             out[id(c)] = r
             continue
-        out[id(c)] = decode_sib1(cap.x, cap.fs, fc2, again[0], log=log)
+        r = out[id(c)] = decode_sib1(cap.x, cap.fs, fc2, again[0], log=log)
+        if not a.si or r.sib1 is None or not r.sib1.si:
+            continue
+        # SI messages: every window of the longest period inside one capture
+        w_s = (r.sib1.si_window_slots or 0) * 1e-3 / 2 ** c0.mu
+        need = max(p for p, _ in r.sib1.si) * 10e-3 + w_s + 30e-3
+        dur = min(max(need, a.sib1_duration), a.si_max_duration)
+        if dur > a.sib1_duration + 1e-3:
+            log(f"PCI {c.n_id}: capturing {dur:.2f} s for SI messages ...")
+            cap = src.capture(fc2, fs, int(dur * fs),
+                              bb_filter=min(c0.bandwidth + 2 * off + 1e6, fs))
+            again = [d for d in ssb_search(cap.x, cap.fs, fc2, scs=c.scs, gscns=[c.gscn],
+                                           cfo_max=abs(c.cfo) + 5e3)
+                     if d.n_id == c.n_id and d.confirmed]
+        if again:
+            r.si = decode_si(cap.x, cap.fs, fc2, again[0], r, log=log)
     return out
 
 
 def _nr_pcap(path, cells, sib1):
-    """MIB (BCCH-BCH) and SIB1 (BCCH-DL-SCH) records for Wireshark's NR RRC."""
+    """MIB (BCCH-BCH), SIB1 and SI (BCCH-DL-SCH) records for Wireshark's NR RRC."""
     from .coding import bits_to_bytes
     from .export import PcapSink
     from .nr.pbch import mib_bits
@@ -494,6 +513,9 @@ def _nr_pcap(path, cells, sib1):
         r = sib1.get(id(c))
         if r is not None and r.payload is not None:
             sink.send(r.payload, t, b"nr-rrc.bcch.dl.sch")
+        for m in (r.si if r is not None else []):
+            if m.payload is not None:
+                sink.send(m.payload, t, b"nr-rrc.bcch.dl.sch")
     sink.close()
     log(f"saved {sink.count} NR RRC messages to {path}")
 
@@ -627,8 +649,14 @@ def build_parser():
     s.add_argument("--sib1-duration", type=float, default=0.2,
                    help="length of the SIB1 capture [s] (default 0.2; repetitions are "
                         "soft-combined, longer helps weak cells)")
+    s.add_argument("--si", action="store_true",
+                   help="also decode the SI messages scheduled by SIB1 (implies --sib1). Live: "
+                        "one more capture long enough for the longest SI period")
+    s.add_argument("--si-max-duration", type=float, default=1.0,
+                   help="longest capture for SI messages [s] (default 1.0)")
     s.add_argument("--pcap", metavar="FILE",
-                   help="write the MIBs and SIB1s to a pcap file for Wireshark (NR RRC)")
+                   help="write the MIBs, SIB1s and SI messages to a pcap file for Wireshark "
+                        "(NR RRC)")
     add_sdr_args(s)
     add_file_args(s)
     s.set_defaults(func=cmd_nr)

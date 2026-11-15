@@ -23,7 +23,7 @@ import numpy as np
 from ..dsp import resample
 from . import ldpc, pdcch, pdsch, polar
 from .pdcch import Coreset0, Dci10Si, coreset0
-from .rrc import NrSib1, decode_bcch_dlsch
+from .rrc import NrSib1, NrSystemInformation, decode_bcch_dlsch
 from .search import NrCell
 from .synth import SSB_SYMBOLS
 
@@ -196,14 +196,15 @@ class DciRx:
     how: str = "decoded"      # decoded | combined (PDCCH soft-combined) | matched (known DCI)
 
 
-def decode_pdcch(grid: np.ndarray, c0: Coreset0, n_id: int, slot: int, sym0: int):
+def decode_pdcch(grid: np.ndarray, c0: Coreset0, n_id: int, slot: int, sym0: int,
+                 counts: dict | None = None):
     """Blind decoding of the Type0 CSS candidates. Returns a list of
     (level, cce, Dci10Si, snr_db)."""
     h, noise = _rb_channel(grid, c0, n_id, slot, sym0)
     a_len = pdcch.dci10_si_size(c0.n_rb)
     out = []
     used: set = set()
-    for cce, lv in sorted(pdcch.candidates(c0), key=lambda c: -c[1]):
+    for cce, lv in sorted(pdcch.candidates(c0, counts), key=lambda c: -c[1]):
         l, k, rbs = pdcch.candidate_res(c0, n_id, cce, lv, sym0)
         if used & set(rbs):
             continue
@@ -242,7 +243,7 @@ WEAK_DMRS_METRIC = 6.0       # coherent DMRS energy / noise-only expectation
 _SLOPES = np.linspace(-0.04, 0.04, 33)       # rad per subcarrier
 
 
-def decode_pdcch_combined(slots: list, c0: Coreset0, n_id: int):
+def decode_pdcch_combined(slots: list, c0: Coreset0, n_id: int, counts: dict | None = None):
     """PDCCH of a weak cell: soft-combine one candidate over the monitoring
     occasions of one SSB index (same CCEs and scrambling every period).
 
@@ -257,7 +258,7 @@ def decode_pdcch_combined(slots: list, c0: Coreset0, n_id: int):
     occasion, [(index into slots, RV)], snr_db) or None."""
     a_len = pdcch.dci10_si_size(c0.n_rb)
     rv_pos = a_len - 18                       # RV field: 2 bits before SI ind. + 15 reserved
-    for cce, lv in sorted(pdcch.candidates(c0), key=lambda c: -c[1]):
+    for cce, lv in sorted(pdcch.candidates(c0, counts), key=lambda c: -c[1]):
         l_re, k_re, rbs = pdcch.candidate_res(c0, n_id, cce, lv, sym0=0)
         occ = []
         for idx, (g, slot, sym0) in enumerate(slots):
@@ -338,13 +339,13 @@ def _flat_llr(g: np.ndarray, c0: Coreset0, n_id: int, slot: int, sym0: int, cce:
 
 
 def match_known_dci(g: np.ndarray, c0: Coreset0, n_id: int, slot: int, sym0: int,
-                    known: dict, cache: dict):
+                    known: dict, cache: dict, counts: dict | None = None):
     """Look for a DCI already decoded elsewhere (any RV) in this slot: the
     correlation of the soft bits with the known codewords, normalised to
     N(0, 1) under noise. Returns (level, cce, Dci10Si, sigma) or None."""
     best = None
     for dci0, lv in known.items():
-        for cce, lv2 in pdcch.candidates(c0):
+        for cce, lv2 in pdcch.candidates(c0, counts):
             if lv2 != lv:
                 continue
             llr = _flat_llr(g, c0, n_id, slot, sym0, cce, lv)
@@ -388,16 +389,37 @@ def _ssb_blocked(cell: NrCell, c0: Coreset0, t_slot: float, slot: int, scs_ssb: 
     return out
 
 
+INTERFERENCE_RATIO = 3.0     # subcarrier power / local median that marks a spur
+
+
+def _spur_subcarriers(grid: np.ndarray, symbols: list[int], prbs: list[int]) -> set:
+    """Subcarriers of the allocation hit by narrowband interference (e.g.
+    receiver spurs): their power over the PDSCH symbols is far above the
+    median of the neighbouring subcarriers. Such REs give confident and
+    repeatable wrong soft bits, which combining would only reinforce."""
+    ks = np.sort(np.concatenate([12 * p + np.arange(12) for p in prbs]))
+    pw = np.mean(np.abs(grid[np.ix_(symbols, ks)]) ** 2, axis=0)
+    out = set()
+    for i, k in enumerate(ks):
+        lo, hi = max(0, i - 12), min(len(ks), i + 13)
+        if pw[i] > INTERFERENCE_RATIO * np.median(pw[lo:hi]):
+            out.add(int(k))
+    return out
+
+
 def pdsch_llr(grid: np.ndarray, alloc: pdsch.Allocation, n_id: int, slot: int,
-              blocked: set | None = None) -> tuple[np.ndarray, float]:
-    """Soft bits (descrambled) of the PDSCH of one DCI and its SINR [dB]."""
+              blocked: set | None = None, dmrs_crb0: int = 0) -> tuple[np.ndarray, float]:
+    """Soft bits (descrambled) of the PDSCH of one DCI and its SINR [dB].
+    dmrs_crb0: common RB index of CORESET#0's lowest RB. The DMRS sequence
+    starts at CORESET#0 for SIB1 (Type0-PDCCH CSS, SI-RNTI), at common RB 0
+    (point A) for everything else, e.g. SI messages (38.211 7.4.1.1.2)."""
     pil_k, pil_v = [], []
     for l in alloc.dmrs:
-        ref = pdsch.dmrs_seq(slot, l, n_id, 6 * alloc.dci.n_rb * 2)
+        ref = pdsch.dmrs_seq(slot, l, n_id, 12 * (alloc.dci.n_rb + dmrs_crb0))
         for p in sorted(alloc.prbs):
             k = 12 * p + np.arange(0, 12, 2)
             pil_k.append(k)
-            pil_v.append(grid[l, k] * np.conj(ref[k // 2]))
+            pil_v.append(grid[l, k] * np.conj(ref[k // 2 + 6 * dmrs_crb0]))
     pil_k = np.concatenate(pil_k)
     pil_v = np.concatenate(pil_v)
     nd = len(alloc.dmrs)
@@ -417,7 +439,11 @@ def pdsch_llr(grid: np.ndarray, alloc: pdsch.Allocation, n_id: int, slot: int,
     y = grid[l_re, k_re]
     g2 = np.abs(hk) ** 2
     z = y * np.conj(hk) / np.maximum(g2, 1e-20)
-    llr = pdsch.demap(z, g2 / max(noise_d, 1e-20), alloc.qm)
+    gain = g2 / max(noise_d, 1e-20)
+    spurs = _spur_subcarriers(grid, list(range(alloc.s, alloc.s + alloc.length)), alloc.prbs)
+    if spurs and len(spurs) < 0.4 * 12 * len(alloc.prbs):
+        gain = np.where(np.isin(k_re, list(spurs)), 0.0, gain)       # erasures
+    llr = pdsch.demap(z, gain, alloc.qm)
     llr *= 1 - 2 * pdsch.scrambling(n_id, len(llr)).astype(np.float64)
     sinr = float(np.mean(g2) / max(noise_d, 1e-20))
     return llr, 10 * np.log10(max(sinr, 1e-9))
@@ -437,6 +463,7 @@ class Sib1Result:
     error: str | None = None
     slots_tried: int = 0
     rvs: list[int] = field(default_factory=list)
+    si: list = field(default_factory=list)  # SiMessage per scheduled SI message (--si)
 
     @property
     def point_a(self) -> float | None:
@@ -463,97 +490,171 @@ def coreset_in_capture(c0: Coreset0, fs: float, fc: float, usable: float = 0.49)
     return (c0.f_low >= fc - usable * fs) and (c0.f_low + c0.bandwidth <= fc + usable * fs)
 
 
-def decode_sib1(x: np.ndarray, fs: float, fc: float, cell: NrCell, log=None) -> Sib1Result:
+@dataclass
+class _Ctx:
+    x: np.ndarray
+    fs: float
+    fc: float
+    cell: NrCell
+    c0: Coreset0
+    frames: list
+    cfo: float
+    counts: dict | None = None        # PDCCH candidates per aggregation level
+    tdra: list | None = None          # pdsch-TimeDomainAllocationList (not Type0 CSS)
+
+    @property
+    def n_slot(self) -> int:
+        return 10 * 2 ** self.c0.mu
+
+    def slot_time(self, f: FrameRef, s: int) -> tuple[float, int, int]:
+        """(capture time, SFN, slot) of slot s counted from the start of frame f."""
+        n = self.n_slot
+        t = f.t + (s // n) * 10e-3 + sym_start(self.c0.scs, (s % n) * 14)
+        return t, (f.sfn + s // n) % 1024, s % n
+
+
+def _context(x, fs, fc, cell: NrCell, res: Sib1Result) -> _Ctx | None:
+    """Common checks and timing; sets res.error when SIB1 cannot be tried."""
     m = cell.mib
-    res = Sib1Result(cell.n_id, None)
     if m is None:
         res.error = "MIB not decoded"
-        return res
+        return None
     if not m.sib1_present:
         res.error = "no CORESET#0 (k_SSB > 23)"
-        return res
-    scs_ssb = cell.scs
-    c0 = coreset0(m, cell.f_ref, scs_ssb)
+        return None
+    c0 = coreset0(m, cell.f_ref, cell.scs)
     res.coreset = c0
     if c0 is None:
         res.error = "CORESET#0 configuration not supported"
-        return res
-    res.crb_ssb = cell.f_ref - 120 * scs_ssb - m.k_ssb * 15000
+        return None
+    res.crb_ssb = cell.f_ref - 120 * cell.scs - m.k_ssb * 15000
     if not coreset_in_capture(c0, fs, fc):
         res.error = (f"CORESET#0 ({c0.f_low / 1e6:.3f}-{(c0.f_low + c0.bandwidth) / 1e6:.3f} MHz) "
                      f"is not inside the capture; tune to {c0.f_center / 1e6:.3f} MHz")
+        return None
+    frames = frames_in(frame_refs(cell, cell.scs), len(x) / fs)
+    return _Ctx(x, fs, fc, cell, c0, frames, cell.cfo * c0.f_center / cell.f_ref)
+
+
+def _grids(ctx: _Ctx, occ: dict) -> list:
+    """Demodulate the slots of occ {key: (t, sfn, slot, sym0, group)} ->
+    list of (t, sfn, slot, sym0, group, grid)."""
+    out = []
+    for t, sfn, slot, sym0, grp in sorted(occ.values(), key=lambda v: v[0]):
+        g = slot_grid(ctx.x, ctx.fs, ctx.fc, ctx.c0, t, slot, ctx.cfo)
+        if g is not None:
+            out.append((t, sfn, slot, sym0, grp, g))
+    return out
+
+
+def _slot_key(it) -> tuple:
+    return round(it[0] * 1e7), it[3]
+
+
+def _receive(ctx: _Ctx, items: list, si_indicator: int, combine_pdcch: bool,
+             dmrs_crb0: int = 0, decoded: dict | None = None):
+    """DCIs (SI-RNTI, given SI indicator) and PDSCH soft bits of the slots:
+    decoded alone; if none and combine_pdcch, the PDCCHs of each group
+    combined; then the known DCIs matched in the remaining slots. decoded:
+    PDCCH results already computed per slot (_slot_key).
+    Returns (dcis, rx) with rx = [(Allocation, llr, sinr, DciRx)]."""
+    cell, c0, m = ctx.cell, ctx.c0, ctx.cell.mib
+    dcis: list[DciRx] = []
+    rx = []
+
+    def add(it, d: DciRx):
+        t, sfn, slot, sym0, _, g = it
+        dcis.append(d)
+        a = pdsch.allocation(d.dci, m.dmrs_type_a_pos, ctx.tdra)
+        if a is None or a.tbs == 0:
+            return
+        llr, sinr = pdsch_llr(g, a, cell.n_id, slot, _ssb_blocked(cell, c0, t, slot, cell.scs),
+                              dmrs_crb0)
+        rx.append((a, llr, sinr, d))
+
+    for it in items:
+        t, sfn, slot, sym0, _, g = it
+        res = decoded.get(_slot_key(it)) if decoded is not None else None
+        if res is None:
+            res = decode_pdcch(g, c0, cell.n_id, slot, sym0, ctx.counts)
+        for lv, cce, dci, snr in res:
+            if dci.si_indicator == si_indicator:
+                add(it, DciRx(t, sfn, slot, lv, cce, dci, snr))
+    if not dcis and combine_pdcch:
+        groups: dict = {}
+        for it in items:
+            groups.setdefault(it[4], []).append(it)
+        for grp in groups.values():
+            r = decode_pdcch_combined([(it[5], it[2], it[3]) for it in grp], c0, cell.n_id,
+                                      ctx.counts)
+            if r is None or r[2].si_indicator != si_indicator:
+                continue
+            lv, cce, dci, rvs, snr, _ = r
+            for idx, rv in rvs:
+                it = grp[idx]
+                add(it, DciRx(it[0], it[1], it[2], lv, cce, replace(dci, rv=rv), snr, "combined"))
+    # the same DCI (any RV) in the other slots: correlation with the known
+    # codewords works far below the PDCCH decoding threshold
+    known = {replace(d.dci, rv=0): d.level for d in dcis}
+    if known:
+        have = {round(d.t * 1e7) for d in dcis}
+        cache: dict = {}
+        for it in items:
+            if round(it[0] * 1e7) in have:
+                continue
+            mk = match_known_dci(it[5], c0, cell.n_id, it[2], it[3], known, cache, ctx.counts)
+            if mk:
+                lv, cce, dci, sig = mk
+                add(it, DciRx(it[0], it[1], it[2], lv, cce, dci, float(sig), "matched"))
+    return dcis, rx
+
+
+@dataclass
+class _Tb:
+    alloc: pdsch.Allocation
+    payload: bytes
+    combined: int
+    rvs: list
+    sinr_db: float
+
+
+def _decode_tb(rx: list) -> _Tb | None:
+    """Decode the transport block(s) of rx: per (TBS, Qm, R) group single
+    transmissions first (self-decodable RV 0 / 3 first), then all combined."""
+    groups: dict = {}
+    for item in rx:
+        a = item[0]
+        groups.setdefault((a.tbs, a.qm, a.rate), []).append(item)
+    for (tbs, qm, rate), items in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        order = sorted(items, key=lambda it: (it[0].dci.rv not in (0, 3), -it[2]))
+        tries = [[it] for it in order[:4]] + ([order] if len(order) > 1 else [])
+        for sel in tries:
+            bits = ldpc.dlsch_decode([(it[1], it[0].dci.rv) for it in sel], tbs, rate, qm)
+            if bits is not None:
+                return _Tb(sel[0][0], np.packbits(bits).tobytes(), len(sel),
+                           [it[0].dci.rv for it in sel], float(np.mean([it[2] for it in sel])))
+    return None
+
+
+def decode_sib1(x: np.ndarray, fs: float, fc: float, cell: NrCell, log=None) -> Sib1Result:
+    res = Sib1Result(cell.n_id, None)
+    ctx = _context(x, fs, fc, cell, res)
+    if ctx is None:
         return res
-    refs = frame_refs(cell, scs_ssb)
-    frames = frames_in(refs, len(x) / fs)
-    cfo = cell.cfo * c0.f_center / cell.f_ref
-    n_slot = 10 * 2 ** c0.mu
+    c0 = ctx.c0
     beams = sorted({o.ssb_index for o in cell.obs if o.ssb_index is not None})
     occ = {}
     for i in beams:
         n0, parity, sym0 = c0.occasions(i)
-        for f in frames:
+        for f in ctx.frames:
             if f.sfn % 2 != parity:
                 continue
             for ds in (0, 1):
-                s = n0 + ds
-                t = f.t + (s // n_slot) * 10e-3 + sym_start(c0.scs, (s % n_slot) * 14)
-                occ[(round(t * 1e7), sym0)] = (t, (f.sfn + s // n_slot) % 1024, s % n_slot, sym0,
-                                               i, ds)
-    rx: list[tuple[pdsch.Allocation, np.ndarray, float, DciRx]] = []
-    grids = []
-    for t, sfn, slot, sym0, beam, ds in sorted(occ.values()):
-        g = slot_grid(x, fs, fc, c0, t, slot, cfo)
-        if g is None:
-            continue
-        grids.append((t, sfn, slot, sym0, beam, ds, g))
-        res.slots_tried += 1
-        for lv, cce, dci, snr in decode_pdcch(g, c0, cell.n_id, slot, sym0):
-            d = DciRx(t, sfn, slot, lv, cce, dci, snr)
-            res.dcis.append(d)
-            if dci.si_indicator != 0:
-                continue
-            a = pdsch.allocation(dci, m.dmrs_type_a_pos)
-            if a is None or a.tbs == 0:
-                continue
-            llr, sinr = pdsch_llr(g, a, cell.n_id, slot, _ssb_blocked(cell, c0, t, slot, scs_ssb))
-            rx.append((a, llr, sinr, d))
-    def add(item, d: DciRx):
-        t, sfn, slot, sym0, _, _, g = item
-        res.dcis.append(d)
-        if d.dci.si_indicator != 0:
-            return
-        a = pdsch.allocation(d.dci, m.dmrs_type_a_pos)
-        if a is None or a.tbs == 0:
-            return
-        llr, sinr = pdsch_llr(g, a, cell.n_id, slot, _ssb_blocked(cell, c0, t, slot, scs_ssb))
-        rx.append((a, llr, sinr, d))
-
-    if not res.dcis:
-        # weak cell: combine the PDCCH over the occasions of each beam / slot
-        groups_w: dict = {}
-        for item in grids:
-            groups_w.setdefault((item[4], item[5]), []).append(item)
-        for items in groups_w.values():
-            r = decode_pdcch_combined([(it[6], it[2], it[3]) for it in items], c0, cell.n_id)
-            if r is None:
-                continue
-            lv, cce, dci, rvs, snr, _ = r
-            for idx, rv in rvs:
-                it = items[idx]
-                add(it, DciRx(it[0], it[1], it[2], lv, cce, replace(dci, rv=rv), snr, "combined"))
-    # the same DCI (any RV) in the other occasions: correlation with the
-    # known codewords works far below the PDCCH decoding threshold
-    known = {replace(d.dci, rv=0): d.level for d in res.dcis}
-    if known:
-        have = {round(d.t * 1e7) for d in res.dcis}
-        cache: dict = {}
-        for it in grids:
-            if round(it[0] * 1e7) in have:
-                continue
-            mk = match_known_dci(it[6], c0, cell.n_id, it[2], it[3], known, cache)
-            if mk:
-                lv, cce, dci, sig = mk
-                add(it, DciRx(it[0], it[1], it[2], lv, cce, dci, float(sig), "matched"))
+                t, sfn, slot = ctx.slot_time(f, n0 + ds)
+                occ[(round(t * 1e7), sym0)] = (t, sfn, slot, sym0, (i, ds))
+    items = _grids(ctx, occ)
+    res.slots_tried = len(items)
+    res.dcis, rx = _receive(ctx, items, 0, combine_pdcch=True)
     if log:
         n_dec = sum(1 for d in res.dcis if d.how == "decoded")
         log(f"PCI {cell.n_id}: {res.slots_tried} Type0-PDCCH slots, {len(res.dcis)} DCIs "
@@ -561,34 +662,162 @@ def decode_sib1(x: np.ndarray, fs: float, fc: float, cell: NrCell, log=None) -> 
     if not rx:
         res.error = "no DCI 1_0 with SI-RNTI found" if not res.dcis else "no SIB1 PDSCH"
         return res
-    groups: dict = {}
-    for item in rx:
-        a = item[0]
-        groups.setdefault((a.tbs, a.qm, a.rate), []).append(item)
-    for key, items in sorted(groups.items(), key=lambda kv: -len(kv[1])):
-        tbs, qm, rate = key
-        # single transmissions (self-decodable RV 0 / 3 first), then all combined
-        order = sorted(items, key=lambda it: (it[0].dci.rv not in (0, 3), -it[2]))
-        tries = [[it] for it in order[:4]] + ([order] if len(order) > 1 else [])
-        for sel in tries:
-            bits = ldpc.dlsch_decode([(it[1], it[0].dci.rv) for it in sel], tbs, rate, qm)
-            if bits is None:
-                continue
-            payload = np.packbits(bits).tobytes()
-            res.alloc = sel[0][0]
-            res.pdsch_sinr_db = float(np.mean([it[2] for it in sel]))
-            res.combined = len(sel)
-            res.rvs = [it[0].dci.rv for it in sel]
-            res.payload = payload
-            try:
-                kind, sib = decode_bcch_dlsch(payload)
-            except (ValueError, IndexError):
-                kind, sib = "undecodable", None
-            res.sib1 = sib if kind == "SIB1" else None
-            if res.sib1 is None:
-                res.error = f"transport block decoded but it is not a SIB1 ({kind})"
-            return res
-    res.alloc = rx[0][0]
-    res.pdsch_sinr_db = float(np.mean([it[2] for it in rx]))
-    res.error = f"PDSCH CRC failed ({len(rx)} transmissions combined)"
+    tb = _decode_tb(rx)
+    if tb is None:
+        res.alloc = rx[0][0]
+        res.pdsch_sinr_db = float(np.mean([it[2] for it in rx]))
+        res.error = f"PDSCH CRC failed ({len(rx)} transmissions combined)"
+        return res
+    res.alloc, res.payload, res.combined = tb.alloc, tb.payload, tb.combined
+    res.rvs, res.pdsch_sinr_db = tb.rvs, tb.sinr_db
+    try:
+        kind, sib = decode_bcch_dlsch(tb.payload)
+    except (ValueError, IndexError):
+        kind, sib = "undecodable", None
+    res.sib1 = sib if kind == "SIB1" else None
+    if res.sib1 is None:
+        res.error = f"transport block decoded but it is not a SIB1 ({kind})"
     return res
+
+
+# --------------------------------------------------------- SI messages
+MAX_SI_SLOTS = 400            # slots searched per SI message before its DCI is found
+
+
+@dataclass
+class SiMessage:
+    """One SI message of the SIB1 schedule (38.331 5.2.2.3.2)."""
+    index: int                # n: position in schedulingInfoList (1-based)
+    period: int               # si-Periodicity [radio frames]
+    sibs: list[str]           # SIBs mapped to it by SIB1
+    windows: int = 0          # SI-windows (partly) inside the capture
+    slots_tried: int = 0
+    dcis: list[DciRx] = field(default_factory=list)
+    alloc: pdsch.Allocation | None = None
+    combined: int = 0
+    rvs: list[int] = field(default_factory=list)
+    pdsch_sinr_db: float | None = None
+    payload: bytes | None = None
+    info: NrSystemInformation | None = None
+    error: str | None = None
+
+
+def si_window_slots(ctx: _Ctx, n: int, period: int, w: int, ss=None) -> dict:
+    """Slots of the SI-windows of SI message n in the capture: the window
+    starts in the frame with SFN mod T = floor(x / N), slot x mod N, with
+    x = (n - 1) w, and lasts w slots. -> ({key: (t, sfn, slot, sym0, (slot in
+    the window, sym0))}, {key: window id}). ss: the SearchSpace of
+    searchSpaceOtherSystemInformation (from SIB1): only its monitoring
+    slots and symbols; without it every slot of the window is searched."""
+    c0 = ctx.c0
+    nsl = ctx.n_slot
+    xw = (n - 1) * w
+    sym0s = sorted({0} | {s if s is not None else c0.n_symb for s in c0.first_symbols})
+    if ss is not None and ss.first_symbols:
+        sym0s = ss.first_symbols
+    out = {}
+    windows = {}
+    for f in ctx.frames:
+        if f.sfn % period != (xw // nsl) % period:
+            continue
+        for j in range(w):
+            t, sfn, slot = ctx.slot_time(f, xw % nsl + j)
+            if t + 1e-3 > len(ctx.x) / ctx.fs:
+                break
+            if ss is not None and ss.period:
+                dur = ss.duration or 1
+                if (sfn * nsl + slot - (ss.offset or 0)) % ss.period >= dur:
+                    continue
+            for s0 in sym0s:
+                out[(round(t * 1e7), s0)] = (t, sfn, slot, s0, (j, s0))
+                windows[(round(t * 1e7), s0)] = f.sfn
+    return out, windows
+
+
+def decode_si(x: np.ndarray, fs: float, fc: float, cell: NrCell, sib1: Sib1Result,
+              log=None) -> list[SiMessage]:
+    """SI messages scheduled by a decoded SIB1. PDCCHs are searched on
+    CORESET#0 in every slot of the SI-windows (DCI 1_0 SI-RNTI with SI
+    indicator 1); the transmissions of one message are matched and
+    soft-combined like SIB1. Messages scheduled in a search space on another
+    CORESET (searchSpaceOtherSystemInformation) are not found."""
+    s = sib1.sib1
+    if s is None or not s.si or s.si_window_slots is None:
+        return []
+    tmp = Sib1Result(cell.n_id, None)
+    ctx = _context(x, fs, fc, cell, tmp)
+    msgs = [SiMessage(n + 1, per, sibs) for n, (per, sibs) in enumerate(s.si)]
+    if ctx is None:
+        for mm in msgs:
+            mm.error = tmp.error
+        return msgs
+    pa = sib1.point_a
+    crb0 = int(round((ctx.c0.f_low - pa) / (12 * ctx.c0.scs))) if pa is not None else 0
+    ctx.tdra = s.pdsch_tdra or None
+    ss = s.search_spaces.get(s.ss_osi) if s.ss_osi else None
+    if ss is not None:
+        if ss.coreset_id not in (None, 0):
+            for mm in msgs:
+                mm.error = (f"SI search space {ss.id} is on CORESET {ss.coreset_id} "
+                            f"(only CORESET#0 is supported)")
+            return msgs
+        ctx.counts = {lv: n for lv, n in (ss.candidates or {}).items() if n} or None
+    for mm in msgs:
+        occ, win_of = si_window_slots(ctx, mm.index, mm.period, s.si_window_slots, ss)
+        wins: dict = {}
+        for k in sorted(occ, key=lambda k: occ[k][0]):
+            wins.setdefault(win_of[k], []).append(k)
+        mm.windows = len(wins)
+        if not occ:
+            mm.error = (f"no SI-window in the capture (period {mm.period * 10} ms: "
+                        f"capture at least {mm.period * 10 + 20} ms)")
+            continue
+        # search whole windows until a DCI shows up, then only the same
+        # window slots in the other windows (gNBs repeat their pattern)
+        items, decoded, offsets = [], {}, None
+        budget = MAX_SI_SLOTS
+        for keys in wins.values():
+            if offsets is not None:
+                keys = [k for k in keys if occ[k][4] in offsets]
+            keys = keys[:budget]
+            budget -= len(keys)
+            got = _grids(ctx, {k: occ[k] for k in keys})
+            if offsets is None:
+                for it in got:
+                    res = decode_pdcch(it[5], ctx.c0, cell.n_id, it[2], it[3], ctx.counts)
+                    decoded[_slot_key(it)] = res
+                    if any(d[2].si_indicator == 1 for d in res):
+                        offsets = (offsets or set()) | {it[4]}
+            items += got
+            if budget <= 0 and offsets is None:
+                break
+        if offsets is not None:
+            items = [it for it in items if it[4] in offsets]
+        mm.slots_tried = len(items)
+        # a gNB that uses the same window slots in every period gets its
+        # PDCCHs combined over the windows when none decodes alone
+        mm.dcis, rx = _receive(ctx, items, 1, combine_pdcch=True, dmrs_crb0=crb0,
+                               decoded=decoded)
+        if not rx:
+            mm.error = "no DCI 1_0 with SI-RNTI in its SI-windows"
+            continue
+        tb = _decode_tb(rx)
+        if tb is None:
+            mm.alloc = rx[0][0]
+            mm.pdsch_sinr_db = float(np.mean([it[2] for it in rx]))
+            mm.error = f"PDSCH CRC failed ({len(rx)} transmissions combined)"
+            continue
+        mm.alloc, mm.payload, mm.combined, mm.rvs = tb.alloc, tb.payload, tb.combined, tb.rvs
+        mm.pdsch_sinr_db = tb.sinr_db
+        try:
+            kind, info = decode_bcch_dlsch(tb.payload)
+        except (ValueError, IndexError):
+            kind, info = "undecodable", None
+        if kind == "SI":
+            mm.info = info
+        else:
+            mm.error = f"transport block decoded but it is not a SystemInformation ({kind})"
+    if log:
+        ok = sum(1 for mm in msgs if mm.payload)
+        log(f"PCI {cell.n_id}: {ok}/{len(msgs)} SI messages decoded")
+    return msgs

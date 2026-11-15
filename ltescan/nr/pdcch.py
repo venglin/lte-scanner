@@ -118,12 +118,16 @@ def cce_regs(n_rb: int, n_symb: int, n_id: int, cce: int, level: int) -> tuple[i
     return tuple(sorted(out))
 
 
-def candidates(c0: Coreset0) -> list[tuple[int, int]]:
-    """(first CCE, aggregation level) of the Type0 CSS candidates
-    (38.213 10.1, Y = 0)."""
+def candidates(c0: Coreset0, counts: dict | None = None) -> list[tuple[int, int]]:
+    """(first CCE, aggregation level) of the common search space candidates
+    on CORESET#0 (38.213 10.1, Y = 0). counts: level -> number of
+    candidates (Type0 CSS: 4/2/1 at levels 4/8/16)."""
     n = c0.n_cce
     out = []
-    for lv, m_l in zip(AGGREGATION_LEVELS, (4, 2, 1)):
+    counts = counts or {4: 4, 8: 2, 16: 1}
+    for lv, m_l in sorted(counts.items()):
+        if m_l == 0:
+            continue
         if lv > n:
             continue
         for m in range(m_l):
