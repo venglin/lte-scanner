@@ -36,6 +36,9 @@ def add_sdr_args(p):
     g.add_argument("--vga", type=int, default=30, help="VGA/baseband gain 0-62 dB (step 2)")
     g.add_argument("--amp", action="store_true", help="enable the RF amplifier (+14 dB)")
     g.add_argument("--serial", help="HackRF serial number")
+    g.add_argument("--hackrf-transfer", metavar="PATH",
+                   help="path to hackrf_transfer (default: $HACKRF_TRANSFER, PATH, then the usual "
+                        "install locations such as PothosSDR or radioconda)")
     g.add_argument("--ppm", type=float, default=0.0,
                    help="known HackRF clock error in ppm (tuning correction)")
 
@@ -72,7 +75,11 @@ def make_exporter(a):
 
 def open_source(a):
     from .sdr import open_sdr
-    return open_sdr(a.driver, lna=a.lna, vga=a.vga, amp=a.amp, serial=a.serial, ppm=a.ppm)
+    try:
+        return open_sdr(a.driver, exe=a.hackrf_transfer, lna=a.lna, vga=a.vga, amp=a.amp,
+                        serial=a.serial, ppm=a.ppm)
+    except RuntimeError as e:
+        raise SystemExit(f"error: {e}")
 
 
 def load_file(a, duration=None):

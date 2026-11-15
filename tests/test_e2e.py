@@ -116,6 +116,28 @@ def test_cli_synth_and_cell(tmp_path, capsys):
     assert read_iq(tmp_path / "y.cf32")[0].shape == x.shape
 
 
+def test_find_hackrf_transfer(tmp_path, monkeypatch):
+    import pytest
+    from ltescan import sdr
+    exe = tmp_path / "bin" / ("hackrf_transfer.exe" if sdr.os.name == "nt" else "hackrf_transfer")
+    exe.parent.mkdir()
+    exe.write_bytes(b"")
+    monkeypatch.delenv("HACKRF_TRANSFER", raising=False)
+    monkeypatch.setattr(sdr.shutil, "which", lambda name: None)
+    monkeypatch.setattr(sdr, "_hackrf_candidates", lambda: [tmp_path / "nope", exe])
+    assert sdr.find_hackrf_transfer() == str(exe)            # install-dir fallback
+    monkeypatch.setattr(sdr, "_hackrf_candidates", lambda: [])
+    assert sdr.find_hackrf_transfer() is None
+    with pytest.raises(RuntimeError, match="--hackrf-transfer"):
+        sdr.HackRfTransfer()
+    monkeypatch.setenv("HACKRF_TRANSFER", str(exe))            # explicit env var
+    assert sdr.find_hackrf_transfer() == str(exe)
+    assert sdr.HackRfTransfer().exe == [str(exe)]
+    monkeypatch.setenv("HACKRF_TRANSFER", str(tmp_path / "missing"))
+    with pytest.raises(RuntimeError, match="does not exist"):
+        sdr.find_hackrf_transfer()
+
+
 def test_hackrf_transfer_path_and_band_scan():
     """Drive HackRfTransfer + Scanner.scan_band with a fake hackrf_transfer."""
     import sys

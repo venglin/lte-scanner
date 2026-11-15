@@ -40,10 +40,14 @@ pip install -e .[plot,test,fast]
 
 `ltescan` drives the HackRF in one of two ways:
 
-1. **`hackrf_transfer`** (default): the program from the *HackRF host tools* must be on
-   `PATH`. On Windows the easiest way to get it is **radioconda** or the **PothosSDR**
-   installer. The device needs the WinUSB driver (installed by those packages or by
-   Zadig). Check with `hackrf_info`.
+1. **`hackrf_transfer`** (default): the program from the *HackRF host tools*. On Windows
+   the easiest way to get it is **radioconda** or the **PothosSDR** installer. The device
+   needs the WinUSB driver (installed by those packages or by Zadig). Check with
+   `hackrf_info`. `ltescan` looks for `hackrf_transfer` in this order: `--hackrf-transfer
+   PATH`, the `HACKRF_TRANSFER` environment variable, `PATH`, then the usual install
+   directories (`C:\Program Files\PothosSDR\bin`, `%USERPROFILE%\radioconda\Library\bin`
+   and other conda prefixes, `/opt/homebrew/bin`, `/usr/local/bin`). The installers do not
+   always add their directory to `PATH`.
 2. **SoapySDR** (`--driver soapy`): requires the `SoapySDR` and `SoapyHackRF` Python
    modules.
 
@@ -234,7 +238,7 @@ ltescan/
   export.py     MAC-LTE framing, UDP and pcap sinks for Wireshark
   _jit.py       optional numba kernels (Viterbi, turbo max-log-MAP)
   cli.py        command-line interface
-tests/          58 tests (unit, end-to-end on synthetic signals, Wireshark dissection)
+tests/          59 tests (unit, end-to-end on synthetic signals, Wireshark dissection)
 ```
 
 Tests: `pytest -q` (~35 s). The Wireshark tests run when `tshark` is installed.

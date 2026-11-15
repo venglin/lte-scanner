@@ -23,6 +23,51 @@ def pick_bb_filter(bw: float) -> float:
     return HACKRF_BB_FILTERS[-1]
 
 
+def _hackrf_candidates() -> list[Path]:
+    """Usual install locations of hackrf_transfer that are often not on PATH."""
+    env = os.environ
+    dirs = []
+    if os.name == "nt":
+        for pf in {env.get("ProgramFiles"), env.get("ProgramFiles(x86)"),
+                   env.get("ProgramW6432"), r"C:\Program Files"}:
+            if pf:
+                dirs += [Path(pf) / "PothosSDR" / "bin", Path(pf) / "HackRF" / "bin",
+                         Path(pf) / "hackrf" / "bin"]
+        home = Path.home()
+        for base in ("radioconda", "miniforge3", "mambaforge", "miniconda3", "anaconda3"):
+            dirs.append(home / base / "Library" / "bin")
+        if env.get("CONDA_PREFIX"):
+            dirs.append(Path(env["CONDA_PREFIX"]) / "Library" / "bin")
+        names = ["hackrf_transfer.exe"]
+    else:
+        dirs += [Path("/opt/homebrew/bin"), Path("/usr/local/bin"), Path("/usr/bin"),
+                 Path("/opt/local/bin")]
+        if env.get("CONDA_PREFIX"):
+            dirs.append(Path(env["CONDA_PREFIX"]) / "bin")
+        names = ["hackrf_transfer"]
+    return [d / n for d in dirs for n in names]
+
+
+def find_hackrf_transfer() -> str | None:
+    """$HACKRF_TRANSFER, then PATH, then the usual install locations."""
+    p = os.environ.get("HACKRF_TRANSFER")
+    if p:
+        if Path(p).is_file():
+            return p
+        raise RuntimeError(f"HACKRF_TRANSFER={p} does not exist")
+    p = shutil.which("hackrf_transfer")
+    if p:
+        return p
+    return next((str(c) for c in _hackrf_candidates() if c.is_file()), None)
+
+
+HACKRF_NOT_FOUND = (
+    "'hackrf_transfer' not found (looked in PATH and the usual PothosSDR/radioconda/"
+    "Homebrew locations). Install the HackRF host tools, add their directory to PATH, "
+    "or point to the program with --hackrf-transfer PATH or the HACKRF_TRANSFER "
+    "environment variable.")
+
+
 @dataclass
 class Capture:
     x: np.ndarray       # complex64 samples
@@ -48,12 +93,13 @@ class HackRfTransfer(IqSource):
 
     def __init__(self, lna: int = 32, vga: int = 30, amp: bool = False, serial: str | None = None,
                  ppm: float = 0.0, exe: str | list | None = None, settle_ms: float = 20.0):
-        exe = exe or shutil.which("hackrf_transfer")
+        if isinstance(exe, str) and not (Path(exe).is_file() or shutil.which(exe)):
+            raise RuntimeError(f"hackrf_transfer program {exe} does not exist")
+        exe = exe or find_hackrf_transfer()
         # exe may also be a command prefix list (e.g. [python, script])
         self.exe = list(exe) if isinstance(exe, (list, tuple)) else ([exe] if exe else None)
         if not self.exe:
-            raise RuntimeError("'hackrf_transfer' not found in PATH (install the HackRF host tools"
-                               " or use --driver soapy)")
+            raise RuntimeError(HACKRF_NOT_FOUND)
         self.lna = int(lna) // 8 * 8
         self.vga = int(vga) // 2 * 2
         self.amp = amp
@@ -131,18 +177,22 @@ class SoapySource(IqSource):
         return Capture(buf[skip:], fs, fc)
 
 
-def open_sdr(driver: str = "auto", **kw) -> IqSource:
+def open_sdr(driver: str = "auto", exe: str | None = None, **kw) -> IqSource:
     if driver in ("auto", "hackrf_transfer"):
         try:
-            return HackRfTransfer(**kw)
-        except RuntimeError:
-            if driver != "auto":
+            return HackRfTransfer(exe=exe, **kw)
+        except RuntimeError as e:
+            if driver != "auto" or exe:
                 raise
+            why = str(e)
+    else:
+        why = ""
     try:
         return SoapySource(**kw)
     except ImportError as e:
-        raise RuntimeError("no driver: install hackrf_transfer (HackRF host tools) "
-                           "or SoapySDR with the SoapyHackRF module") from e
+        raise RuntimeError((why + "\n" if why else "") + "SoapySDR Python bindings are not "
+                           "available either (alternative to hackrf_transfer: SoapySDR with "
+                           "the SoapyHackRF module).") from e
 
 
 # ------------------------------------------------------------------ files
