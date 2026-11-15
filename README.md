@@ -1,8 +1,33 @@
-# lte-scanner — LTE PHY scanner and analyzer for HackRF
+# lte-scanner — LTE and 5G NR cell scanner and analyzer for HackRF
 
-A passive LTE downlink receiver written in pure Python (NumPy/SciPy), with a 5G NR
-cell search on top. It is not a full 3GPP stack. It demodulates the physical layer and
-understands the broadcast and control channels:
+A passive **LTE and 5G NR** downlink receiver for the HackRF One, written in pure Python
+(NumPy/SciPy). It finds cells, demodulates the physical layer and decodes the broadcast
+channels. It is not a full 3GPP stack.
+
+- **5G NR (FR1):** SS/PBCH block search over whole bands (n78, n38, n28, n1, …),
+  polar-coded PBCH, MIB, SSB beams with SS-RSRP, standalone vs non-standalone cells,
+  and soft combining that decodes weak cells down to about −10 dB SNR.
+- **LTE:** cell search, MIB, PDCCH blind decoding, turbo-coded PDSCH, SIB1 (PLMN, TAC,
+  Cell ID), random access responses, paging, and live export to Wireshark.
+- Built-in eNB and gNB signal generators, 72 tests, and live verification on four
+  Polish operators' networks.
+
+The 20 MHz HackRF is enough for NR too: an SS/PBCH block occupies 7.2 MHz even when
+the carrier is 100 MHz wide (see [5G NR](#5g-nr)).
+
+### 5G NR
+
+| Part | What is implemented |
+|---|---|
+| Raster | synchronization raster (GSCN) and NR-ARFCN for FR1, band tables (n1, n3, n7, n8, n20, n28, n38, n40, n41, n77, n78), band scans that tune to every raster entry |
+| Synchronization | PSS search over all GSCNs in a 20 MHz capture with one FFT (sub-band cut-out per GSCN and CFO hypothesis), averaging over SSB periods, SSS (1008 PCIs), fine CFO, TS 38.211 per-symbol phase compensation |
+| SS/PBCH block | PBCH DMRS (SSB index, half frame), DMRS channel estimation, 15 and 30 kHz SCS, L_max 4 and 8 |
+| PBCH → **MIB** | **polar code** (reliability sequence, interleavers, rate matching) with a CRC-aided successive-cancellation list decoder, 38.212 payload interleaving and scrambling; SFN, half frame, SSB index, k_SSB, CORESET#0 and search space #0, cellBarred, intraFreqReselection |
+| Weak cells | all repetitions of one SSB are used together, and PBCHs from different frames are **soft-combined** (SFN and carry hypotheses); about 6 dB better than single blocks |
+| Measurements | SS-RSRP per SSB index (beam), SS-SINR, CFO and receiver clock error |
+| Interpretation | SIB1 present or not (k_SSB): standalone-capable vs non-standalone (EN-DC) cells |
+
+### LTE
 
 | Layer | What is implemented |
 |---|---|
@@ -19,12 +44,13 @@ understands the broadcast and control channels:
 | MAC | **random access responses** (RA-RNTI: timing advance → UE distance, UL grant, temporary C-RNTI); **paging** (P-RNTI, opt-in, subscriber identities always masked) |
 | **Wireshark export** | every decoded transport block (MIB, SIB1, SI, RAR, paging) as MAC-LTE frames: live over UDP, into a pcap file, or piped into Wireshark; Wireshark then decodes all SIBs in full |
 | Monitor | continuous capture → decode → export loop on one carrier |
-| **5G NR** (FR1) | SS/PBCH block search on the synchronization raster (GSCN), PSS/SSS (1008 PCIs), PBCH DMRS (SSB index), polar-coded PBCH with CRC-aided list decoding, **MIB** (SFN, k_SSB, CORESET#0 / search space #0, cellBarred, SIB1 presence → SA vs NSA), SS-RSRP per SSB beam |
 | Scanner | fast 20 MHz captures, spectrum-based carrier detection, candidate testing on the 100 kHz raster, learning the HackRF ppm error |
 
 It also includes a built-in **eNB signal generator** (`ltescan synth`) with a channel
-model (noise, CFO, clock drift, multipath). The tests are built on it, and it lets you
-run the whole chain end to end without hardware.
+model (noise, CFO, clock drift, multipath), and a **gNB SS/PBCH burst generator**
+(`ltescan.nr.synth`: beams, data around the SSB, the per-symbol phase of a real gNB).
+The tests are built on them, and they let you run the whole chain end to end without
+hardware.
 
 ## Installation
 
@@ -56,6 +82,30 @@ Without a HackRF, every command works on IQ files (`--file`).
 
 ## Quick start
 
+5G NR:
+
+```bash
+ltescan nr --band n78 --ppm 13 --lna 40 --vga 40     # scan a whole band
+ltescan nr --gscn 7880 --duration 0.3                # one raster entry, weak cell
+ltescan nr --file n78.cs8 --json nr.json             # offline
+```
+
+Example output of `nr` (synthetic cell, four beams):
+
+```
+NR cell PCI 412 (N_ID1=137, N_ID2=1) @ 3548.640 MHz, GSCN 7880, SSB ARFCN 636576, band n78
+------------------------------------------------------------------------------------------
+SSB: SCS 30 kHz, L_max 8, blocks received: 39, SS-RSRP per SSB index [dBFS]: #0 -17.0, #1 -14.4, #2 -16.1, #3 -20.5
+Sync: PSS metric 0.39, SSS margin 4.48, DMRS margin 3.77
+CFO: +1408 Hz, receiver clock error ~ +0.40 ppm
+SS-RSRP: -14.4 dBFS/RE, SS-SINR: 4.1 dB
+MIB: SFN 518, half frame 0, SSB index 1, subCarrierSpacingCommon 30 kHz, dmrs-TypeA-Position pos2
+     k_SSB 8, controlResourceSetZero 11, searchSpaceZero 0, cellBarred: notBarred, intraFreqReselection: allowed
+SIB1: scheduled (CORESET#0 present) - standalone-capable cell
+```
+
+LTE:
+
 ```bash
 ltescan bands                         # supported bands and EARFCN ranges
 ltescan earfcn 1575 6300 2655M        # EARFCN <-> frequency
@@ -75,9 +125,6 @@ ltescan cell --file b3.cs8
 
 # follow one carrier and stream everything to Wireshark (see below)
 ltescan monitor --earfcn 1575 --paging --rnti --pcap - | wireshark -k -i -
-
-# 5G NR: scan a band for SS/PBCH blocks and decode their MIB (see below)
-ltescan nr --band n78 --ppm 13 --lna 40 --vga 40
 ```
 
 Without hardware:
@@ -230,7 +277,7 @@ How it works:
    they add up, the best are decoded, and the CRC plus the SFN consistency decide. With
    a weak SSS, the next best cell ids are tried as well.
 
-## How it works
+## How it works (LTE)
 
 ```
 IQ (HackRF / file)
