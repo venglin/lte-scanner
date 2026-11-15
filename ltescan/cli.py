@@ -277,6 +277,8 @@ def cmd_monitor(a):
     if live:
         fc = earfcn_to_freq(a.earfcn) if a.earfcn is not None else parse_freq(a.freq)
         src = open_source(a)
+        if hasattr(src, "vga"):
+            src.vga_max = src.vga              # the AGC never goes above the requested gain
         fs = a.rate or 15.36e6
         file_x = None
     else:
@@ -285,6 +287,10 @@ def cmd_monitor(a):
     cfo_max = a.cfo_max or auto_cfo_max(fc)
     pci = a.pci
     tot = {"bursts": 0, "pdus": 0, "SI": 0, "RAR": 0, "PCH": 0}
+    seen_rntis: dict = {}              # C-RNTI -> (first burst, last burst)
+    last_cfo = None
+    per_burst: list = []
+    csv_f = _monitor_csv(a.csv) if getattr(a, "csv", None) else None
     n = 0
     pos = 0
     try:
@@ -301,15 +307,31 @@ def cmd_monitor(a):
                 x = file_x[pos:pos + m]
                 t_cap = file_t0 + pos / fs
                 pos += m
+            if live:
+                _monitor_agc(src, x)
             rx = LteReceiver(x, fs, fc, cfo_max=cfo_max)
             cells = rx.search(max_cells=3)
             cell = next((c for c in cells if pci is None or c.n_id == pci), None)
+            refound = False
+            if cell is None and pci is not None and last_cfo is not None:
+                # the search looks for further cells only near the CFO of the
+                # strongest one; a phantom with another CFO then hides the
+                # followed cell. Search again around the cell's last CFO.
+                from .dsp import mix
+                rx2 = LteReceiver(mix(x, -last_cfo, fs), fs, fc, cfo_max=3e3)
+                cells2 = rx2.search(max_cells=6, pmr_min=4.0)
+                cell = next((c for c in cells2 if c.n_id == pci), None)
+                if cell is not None:
+                    rx, refound = rx2, True
             stamp = time.strftime("%H:%M:%S", time.localtime(t_cap))
             if cell is None:
-                print(f"{stamp} burst {n}: no cell" + (f" (PCI {pci})" if pci is not None else ""),
-                      flush=True)
+                seen = ", ".join(f"PCI {c.n_id}" for c in cells) or "nothing"
+                print(f"{stamp} burst {n}: no cell" + (f" (PCI {pci}; found {seen})"
+                                                       if pci is not None else ""), flush=True)
                 continue
             pci = cell.n_id
+            if not refound:
+                last_cfo = cell.cfo
             counts = {"SI": 0, "RAR": 0, "PCH": 0, "BCH": 0}
 
             def on_pdu(kind, rnti, sfn, sf, payload, t_off):
@@ -328,14 +350,69 @@ def cmd_monitor(a):
             for k in ("SI", "RAR", "PCH"):
                 tot[k] += counts[k]
             print(report.burst_line(stamp, n, rep, counts), flush=True)
+            conf = rep.confirmed_rntis()
+            new = [r for r in conf if r not in seen_rntis]
+            for r in conf:
+                seen_rntis[r] = (seen_rntis.get(r, (n, n))[0], n)
+            per_burst.append(len(conf))
+            if csv_f:
+                _monitor_csv_row(csv_f, t_cap, n, rep, counts, len(conf), len(new),
+                                 len(seen_rntis))
     except KeyboardInterrupt:
         pass
     finally:
         if ex:
             ex.close()
+        if csv_f:
+            csv_f.close()
     log(f"{tot['bursts']} bursts, {tot['pdus']} PDUs "
         f"(SI {tot['SI']}, RAR {tot['RAR']}, paging {tot['PCH']})")
+    if a.rnti and per_burst:
+        multi = sum(1 for f, l in seen_rntis.values() if l > f)
+        log(f"C-RNTIs: {np.mean(per_burst):.1f} per burst on average, {len(seen_rntis)} distinct "
+            f"in the session ({multi} seen in more than one burst)")
     return 0
+
+
+CSV_FIELDS = ["time", "burst", "pci", "sfn", "rsrp_dbfs", "sinr_db", "cfi", "cce_load",
+              "prb_dl_dci", "prb_dl_energy", "ul_rb_per_sf", "c_rnti", "c_rnti_new",
+              "c_rnti_distinct", "si", "rar", "paging", "subframes"]
+
+
+def _monitor_csv(path):
+    import os
+    new = not os.path.exists(path) or os.path.getsize(path) == 0
+    f = open(path, "a", encoding="utf-8", newline="")
+    if new:
+        f.write(",".join(CSV_FIELDS) + "\n")
+    return f
+
+
+def _monitor_csv_row(f, t, n, rep, counts, n_rnti, n_new, n_distinct):
+    def avg(v, scale=1.0):
+        return f"{np.mean(v) * scale:.3f}" if v else ""
+    cfi = rep.cfi_hist.most_common(1)[0][0] if rep.cfi_hist else ""
+    row = [time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t)), n, rep.sync.n_id,
+           rep.mib.sfn if rep.mib else "", f"{rep.rsrp_dbfs:.1f}", f"{rep.snr_db:.1f}", cfi,
+           avg(rep.cce_load), avg(rep.prb_dl), avg(rep.prb_energy), avg(rep.ul_prbs), n_rnti,
+           n_new, n_distinct, counts.get("SI", 0), counts.get("RAR", 0), counts.get("PCH", 0),
+           rep.subframes]
+    f.write(",".join(str(v) for v in row) + "\n")
+    f.flush()
+
+
+def _monitor_agc(src, x):
+    """Lower the HackRF VGA gain by 6 dB when a burst clips (clipping breaks
+    synchronisation and decoding), raise it back by 2 dB when there is
+    plenty of headroom."""
+    if not hasattr(src, "vga"):
+        return
+    peak = float(np.max(np.abs(np.concatenate([x.real, x.imag])))) if len(x) else 0.0
+    if peak > 0.98 and src.vga > 0:
+        src.vga = max(0, src.vga - 6)
+        log(f"clipping: VGA gain lowered to {src.vga} dB")
+    elif peak < 0.25 and src.vga < getattr(src, "vga_max", src.vga):
+        src.vga = min(src.vga_max, src.vga + 2)
 
 
 def _nr_plan(a, fs):
@@ -618,7 +695,10 @@ def build_parser():
     s.add_argument("--burst", type=float, default=0.2, help="length of each capture [s]")
     s.add_argument("--count", type=int, default=0, help="number of bursts (0 = until Ctrl+C)")
     s.add_argument("--pci", type=int, help="follow this cell (default: strongest)")
-    s.add_argument("--rnti", action="store_true", help="discover active C-RNTIs")
+    s.add_argument("--rnti", action="store_true",
+                   help="discover active C-RNTIs (DCI 0/1A/1/2/2A) and the PRB use they schedule")
+    s.add_argument("--csv", metavar="FILE",
+                   help="append one line per burst (load, RNTIs, RAR, paging) to a CSV file")
     s.add_argument("--cfo-max", type=float, default=None,
                    help="CFO search range [Hz] (default: 20 ppm of the frequency)")
     add_export_args(s)

@@ -3,14 +3,18 @@ demos: PSS/SSS, CRS, PBCH/MIB, PCFICH, PHICH (dummy), PDCCH with DCI and
 PDSCH carrying SIB1, plus a simple radio channel model."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from . import coding
 from .control import (CFI_CODE, pcfich_regs, pcfich_scrambling, pdcch_regs,
-                      pdcch_scrambling, phich_regs, quad_permutation, reg_res)
-from .dci import P_RNTI, SI_RNTI, pack_1a, pack_1c, size_0_1a, size_1c
+                      pdcch_scrambling, phich_regs, quad_permutation, reg_res,
+                      ue_search_space)
+from .coding import int_to_bits
+from .dci import (P_RNTI, SI_RNTI, pack_1a, pack_1c, rbg_size, size_0_1a, size_1c, size_2,
+                  size_2a)
 from .mimo import td_encode
 from .ofdm import mod_subframe
 from .params import TDD_MI, TDD_UL_DL, CellConfig
@@ -34,6 +38,8 @@ class SynthConfig:
     sib1_rb: tuple = (0, 4)          # (first VRB, number of VRBs)
     distributed: bool = False
     extra_rntis: list = field(default_factory=lambda: [0x1234, 0x4321])
+    extra_fmt: str = "1A"            # "1A": random payloads; "2" / "2A": TM4 / TM3 assignments
+    extra_rbg: int = 0b1100          # RBG bitmap pattern (repeated) for formats 2 / 2A
     tdd_config: int = 1
     rar: bool = True                 # RA-RNTI 3 response in subframe 0 of odd frames
     paging: bool = True              # P-RNTI paging in subframe 9 of odd frames
@@ -185,17 +191,42 @@ class EnbSimulator:
             self._broadcast(grid, sf, cfi, P_RNTI, msg, dcis)
         # some UE-specific traffic for RNTI discovery
         n_cce = len(pdcch_regs(cfg, cfi, self.m_i(sf))) // 9
+        # in each UE's own search space (level 2), like a real eNB
+        busy = set(range(0, 4))
         size = size_0_1a(cfg.n_rb, cfg.tdd)
-        for j, rnti in enumerate(self.sc.extra_rntis):
-            cce = 8 + 2 * j
-            if cce + 2 <= n_cce:
+        for rnti in self.sc.extra_rntis:
+            cand = [c for c, ag in ue_search_space(n_cce, rnti, sf)
+                    if ag == 2 and c + 2 <= n_cce and not ({c, c + 1} & busy)]
+            if not cand:
+                continue
+            busy |= {cand[0], cand[0] + 1}
+            if self.sc.extra_fmt in ("2", "2A"):
+                payload = self._dci2(sf)
+            else:
                 payload = self.rng.integers(0, 2, size).astype(np.uint8)
                 payload[0] = 1
-                dcis.append((payload, rnti, cce, 2))
+            dcis.append((payload, rnti, cand[0], 2))
         self._pdcch(grid, sf, dcis)
         if n_sym_dl < n_sym:
             grid[:, n_sym_dl:] = 0
         return grid
+
+    def _dci2(self, sf: int) -> np.ndarray:
+        """Format 2 / 2A payload: type 0 allocation with the configured RBG
+        pattern, one transport block (the second disabled: MCS 0, RV 1)."""
+        cfg = self.sc.cell
+        n_rbg = math.ceil(cfg.n_rb / rbg_size(cfg.n_rb))
+        pat = self.sc.extra_rbg
+        nb = pat.bit_length() or 1
+        bitmap = [(pat >> (nb - 1 - (i % nb))) & 1 for i in range(n_rbg)]
+        b = ([0] if cfg.n_rb > 10 else []) + bitmap
+        b += [0, 0] + ([0, 0] if cfg.tdd else []) + [0] * (4 if cfg.tdd else 3) + [0]
+        b += list(int_to_bits(10, 5)) + [1, 0, 0]          # TB1: MCS 10, NDI 1, RV 0
+        b += [0, 0, 0, 0, 0, 0, 0, 1]                       # TB2 disabled
+        fmt = self.sc.extra_fmt
+        size = size_2(cfg.n_rb, cfg.n_ports, cfg.tdd) if fmt == "2" else             size_2a(cfg.n_rb, cfg.n_ports, cfg.tdd)
+        b += [0] * (size - len(b))
+        return np.array(b, dtype=np.uint8)
 
     def _broadcast(self, grid, sf, cfi, rnti, data: bytes, dcis, rb=(0, 4)):
         """DCI 1A in the common search space (CCE 0, L4) + QPSK PDSCH."""

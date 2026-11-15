@@ -100,6 +100,7 @@ class DciEvent:
     cce: int
     agg: int
     text: str
+    in_ss: bool = True        # C-RNTI: in its UE-specific search space (or the common one, 0/1A)
 
 
 @dataclass
@@ -124,6 +125,8 @@ class CellReport:
     rar_entries: list = field(default_factory=list)      # mac.RarEntry
     paging_msgs: list = field(default_factory=list)      # mac.Paging (masked)
     cce_load: list = field(default_factory=list)
+    sf_alloc: list = field(default_factory=list)     # per subframe: ([(rnti, PRBs)] DL, [(rnti, RBs)] UL)
+    prb_energy: list = field(default_factory=list)   # per subframe: PRB share with PDSCH energy
     subframes: int = 0
     notes: list = field(default_factory=list)
     diag: dict = field(default_factory=dict, repr=False)
@@ -141,11 +144,75 @@ class CellReport:
     def cfo_hz(self):
         return self.sync.cfo
 
+    def _allowed(self) -> set:
+        return set(self.confirmed_rntis()) | {r for r in self.rntis
+                                               if r >= 0xFFF4 or 1 <= r <= 60}
+
+    @property
+    def prb_dl(self) -> list:
+        """Per subframe: share of PRBs assigned by decoded downlink DCIs of
+        SI/P/RA-RNTI and of C-RNTIs that are confirmed or found in their own
+        UE-specific search space (other single hits may be false)."""
+        allowed = self._allowed()
+        out = []
+        for dl, _ in self.sf_alloc:
+            used = set()
+            for r, prbs, in_ss in dl:
+                if in_ss or r in allowed:
+                    used.update(prbs)
+            out.append(len(used) / self.cfg.n_rb if self.cfg else 0.0)
+        return out
+
+    @property
+    def ul_prbs(self) -> list:
+        """Per subframe: uplink RBs granted by DCI 0 (same filter as prb_dl)."""
+        allowed = self._allowed()
+        return [sum(n for r, n, in_ss in ul if in_ss or r in allowed) for _, ul in self.sf_alloc]
+
     def confirmed_rntis(self, min_count: int = 2) -> dict:
         """C-RNTIs seen at least `min_count` times (single hits may be
         false CRC matches)."""
         return {r: n for r, n in self.rntis.most_common()
                 if n >= min_count and 0x3D <= r <= 0xFFF3}
+
+
+def _continues(cce_llr: np.ndarray, cand, cce: int, agg: int, big: int,
+               thresh: float = 0.8) -> bool:
+    """Do CCEs cce+agg .. cce+big carry the rest of the codeword of a DCI
+    found at aggregation level agg (i.e. was it sent at level big)? The
+    known codeword is compared with those soft bits (random: ~0.5)."""
+    from .coding import CRC16, conv_encode, conv_rate_match, crc_attach
+    full = crc_attach(cand.bits, CRC16, cand.rnti)
+    n = cce_llr.shape[1]
+    enc = conv_rate_match(conv_encode(full), n * big)[n * agg:]
+    llr = cce_llr[cce + agg:cce + big].reshape(-1)
+    mag = np.abs(llr)
+    tot = mag.sum()
+    if tot <= 0:
+        return False
+    wrong = (llr < 0) != (enc == 1)
+    return float(1 - mag[wrong].sum() / tot) >= thresh
+
+
+def prb_energy_share(g, ce, cfg: CellConfig, sf: int, cfi: int, ratio: float = 0.25) -> float:
+    """Share of PRBs whose PDSCH region (after the control symbols, CRS REs
+    excluded) carries power: the excess over the noise + interference level
+    of the CRS must reach `ratio` (-6 dB) of the CRS power received in that
+    PRB (channel estimate, so frequency-selective fading does not count).
+    Independent of DCI decoding; interference from neighbours that load
+    the same PRBs can count as use."""
+    n_sym = g.shape[0]
+    start = control.n_ctrl_symbols(cfg, cfi)
+    crs = np.zeros(g.shape, dtype=bool)
+    for port in range(cfg.n_ports):
+        for l, ks, _ in chest.crs_positions(cfg, sf, port):
+            crs[l, ks] = True
+    pw = np.abs(g) ** 2
+    pw[crs] = np.nan
+    per_prb = np.nanmean(pw[start:n_sym].reshape(n_sym - start, cfg.n_rb, 12), axis=(0, 2))
+    hp = np.mean(np.abs(ce.h[0, start:n_sym]) ** 2, axis=0).reshape(cfg.n_rb, 12).mean(axis=1)
+    noise = ce.noise_meas or ce.noise
+    return float(np.mean(per_prb - noise > ratio * hp))
 
 
 # ------------------------------------------------------------ receiver
@@ -237,6 +304,10 @@ class LteReceiver:
         size_1a = dcimod.size_0_1a(cfg.n_rb, cfg.tdd)
         size_1c = dcimod.size_1c(cfg.n_rb)
         size_1 = dcimod.size_1(cfg.n_rb, cfg.tdd)
+        size_2 = size_2a = None
+        if cfg.n_ports >= 2:
+            size_2 = dcimod.size_2(cfg.n_rb, cfg.n_ports, cfg.tdd)
+            size_2a = dcimod.size_2a(cfg.n_rb, cfg.n_ports, cfg.tdd)
         sib1_buf = None
         tdd_cfg = None
         for j in range(n_sf):
@@ -263,7 +334,7 @@ class LteReceiver:
                     rep.diag["h"] = ce.h
             cfi, _conf = control.decode_pcfich(g, ce.h, ce.noise, cfg, sf)
             rep.cfi_hist[cfi] += 1
-            sizes = (size_1a, size_1c, size_1)
+            sizes = (size_1a, size_1c, size_1, size_2, size_2a)
             if cfg.tdd and tdd_cfg is None:
                 # PHICH size (m_i) unknown until SIB1 gives the TDD config:
                 # pick the hypothesis on which a common-search-space DCI
@@ -279,6 +350,8 @@ class LteReceiver:
                 m_i = TDD_MI[tdd_cfg][sf] if cfg.tdd else 1
                 found, load = self._pdcch(g, ce, cfg, sf, sfn, cfi, m_i, sizes, rnti_discovery)
             self._record(rep, found, load)
+            if load is not None:
+                self._load(rep, g, ce, cfg, sf, cfi, m_i, found, rnti_discovery)
             t_sf = (dem.t0 + j * dem.spacing) / dem.fs
             for ev, d in found:
                 if d.fmt not in ("1A", "1C"):
@@ -356,7 +429,10 @@ class LteReceiver:
     def _record(rep, found, load):
         for ev, d in found:
             rep.dcis.append(ev)
-            rep.rntis[ev.rnti] += 1
+            # an eNB places a C-RNTI's DCIs in that UE's search space: hits
+            # elsewhere are CRC coincidences and are not counted
+            if ev.in_ss:
+                rep.rntis[ev.rnti] += 1
             if ev.rnti == dcimod.P_RNTI:
                 rep.paging += 1
             elif 1 <= ev.rnti <= 60:
@@ -364,9 +440,33 @@ class LteReceiver:
         if load is not None:
             rep.cce_load.append(load)
 
+    @staticmethod
+    def _load(rep, g, ce, cfg, sf, cfi, m_i, found, discovery):
+        """Resource use of one subframe: downlink PRBs of the decoded
+        assignments (only meaningful with C-RNTI discovery), PRBs whose
+        PDSCH region carries energy, and uplink RBs granted by DCI 0."""
+        n_rb = cfg.n_rb
+        n_cce = len(control.pdcch_regs(cfg, cfi, m_i)) // 9
+        dl, ul = [], []
+        for ev, d in found:
+            # a genuine C-RNTI DCI lies in the UE's own search space (or the
+            # common one for 0/1A); a random CRC match rarely does
+            ok = ev.in_ss
+            if d.fmt == "0":
+                ul.append((d.rnti, d.n_vrb, ok))
+            elif d.fmt in ("1", "2", "2A"):
+                dl.append((d.rnti, [p for p in d.prbs if p < n_rb], ok))
+            elif d.fmt in ("1A", "1C"):
+                even, odd = pdsch.dci_prbs(d, n_rb)
+                dl.append((d.rnti, [int(p) for p in np.unique(np.concatenate([even, odd]) % n_rb)],
+                           ok))
+        if discovery:
+            rep.sf_alloc.append((dl, ul))
+        rep.prb_energy.append(prb_energy_share(g, ce, cfg, sf, cfi))
+
     def _pdcch(self, g, ce, cfg, sf, sfn, cfi, m_i, sizes, discovery):
         """Blind-decode PDCCH. Returns (list of (DciEvent, Dci), CCE load)."""
-        size_1a, size_1c, size_1 = sizes
+        size_1a, size_1c, size_1, size_2, size_2a = sizes
         try:
             cce_llr, regs = control.pdcch_llr(g, ce.h, ce.noise, cfg, sf, cfi, m_i)
         except (IndexError, ValueError):
@@ -377,14 +477,17 @@ class LteReceiver:
         used = np.zeros(n_cce, dtype=bool)
         found = []
 
-        def try_cand(cce, agg, size, accept_rnti):
+        def try_cand(cce, agg, size, accept_rnti, cand=None):
             if used[cce:cce + agg].any() or not act[cce:cce + agg].all():
                 return None
-            c = control.decode_candidate(cce_llr, cce, agg, size)
+            c = cand or control.decode_candidate(cce_llr, cce, agg, size)
             if not accept_rnti(c.rnti) or c.reliability < self.min_reliability[agg]:
                 return None
             if size == size_1c:
                 d = dcimod.parse_1c(c.bits, cfg.n_rb, c.rnti)
+            elif size in (size_2, size_2a):
+                d = dcimod.parse_2(c.bits, cfg.n_rb, c.rnti, cfg.n_ports,
+                                   "2" if size == size_2 else "2A", cfg.tdd)
             elif size == size_1:
                 d = dcimod.parse_1(c.bits, cfg.n_rb, c.rnti, cfg.tdd)
             else:
@@ -397,6 +500,10 @@ class LteReceiver:
                 d = dcimod.Dci("?", c.rnti, raw=f"{c.size} bits")
             used[cce:cce + agg] = True
             ev = DciEvent(sfn, sf, c.rnti, d.fmt, cce, agg, d.describe())
+            if accept_rnti is not common:
+                ev.in_ss = ((cce, agg) in control.ue_search_space(n_cce, c.rnti, sf)
+                            or (d.fmt in ("0", "1A")
+                                and (cce, agg) in control.common_search_space(n_cce)))
             return ev, d
 
         def common(r):
@@ -414,13 +521,40 @@ class LteReceiver:
             # low -> high: a DCI sent at level L also decodes from its first
             # CCEs (circular-buffer prefix), while a higher-level candidate
             # spanning two DCIs could otherwise swallow both
+            ue_sizes = [s for s in (size_1a, size_1, size_2, size_2a) if s]
             for agg in (1, 2, 4, 8):
                 for cce in range(0, n_cce - agg + 1, agg):
-                    for size in (size_1a, size_1):
-                        res = try_cand(cce, agg, size, crnti)
+                    if used[cce:cce + agg].any() or not act[cce:cce + agg].all():
+                        continue
+                    # a DCI decoded with a wrong size gives a wrong (and, for a
+                    # repeated payload, repeatable) RNTI: decode every size and
+                    # keep the most consistent one, preferring candidates that
+                    # sit in their RNTI's own search space
+                    best = None
+                    for size in ue_sizes:
+                        c = control.decode_candidate(cce_llr, cce, agg, size)
+                        if not crnti(c.rnti) or c.reliability < self.min_reliability[agg]:
+                            continue
+                        in_ss = (cce, agg) in control.ue_search_space(n_cce, c.rnti, sf)
+                        key = (c.reliability, in_ss)
+                        if best is None or key > best[0]:
+                            best = (key, c)
+                    if best:
+                        res = try_cand(cce, agg, best[1].size, crnti, best[1])
                         if res:
                             found.append(res)
-                            break
+                            # a DCI sent at a higher level also decodes from its
+                            # first CCEs: find its real span so that its other
+                            # CCEs are not decoded on their own (that gives a
+                            # wrong, repeatable RNTI)
+                            big = 2 * agg
+                            while big <= 8 and cce % big == 0 and cce + big <= n_cce:
+                                if not _continues(cce_llr, best[1], cce, agg, big):
+                                    break
+                                used[cce:cce + big] = True
+                                res[0].agg = big
+                                res[0].in_ss = res[0].in_ss or (cce, big) in                                     control.ue_search_space(n_cce, res[0].rnti, sf)
+                                big *= 2
         return found, (float(act.mean()) if n_cce else 0.0)
 
     @staticmethod

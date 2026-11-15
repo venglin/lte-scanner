@@ -221,6 +221,20 @@ def sss_detect(x: np.ndarray, hit: PssHit, cfo: float, hyps=None) -> CellSync | 
                     pss_positions=positions, sss_margin=float(margin))
 
 
+def _smooth_sc(h: np.ndarray, w: int) -> np.ndarray:
+    """Moving average over w subcarriers (each half of the DC gap separately,
+    edges with the available neighbours)."""
+    out = np.empty_like(h)
+    half = len(h) // 2
+    ker = np.ones(w)
+    for sl in (slice(0, half), slice(half, len(h))):
+        v = h[sl]
+        num = np.convolve(v, ker, mode="same")
+        den = np.convolve(np.ones(len(v)), ker, mode="same")
+        out[sl] = num / den
+    return out
+
+
 def cancel_sync(xc: np.ndarray, cell: CellSync) -> np.ndarray:
     """Subtract the PSS and SSS of `cell` (channel estimated per occurrence)
     from a CFO-corrected 1.92 Msps buffer (successive interference
@@ -236,7 +250,10 @@ def cancel_sync(xc: np.ndarray, cell: CellSync) -> np.ndarray:
             if start - cp < 0 or start + N > len(y):
                 continue
             yf = np.fft.fft(y[start:start + N])
-            h = yf[bins] / d
+            # smoothed over neighbouring subcarriers: a per-subcarrier y/d
+            # would also remove the PSS/SSS of a time-aligned neighbour
+            # (synchronised networks put every cell's PSS in the same symbol)
+            h = _smooth_sc(yf[bins] / d, 9)
             f = np.zeros(N, dtype=complex)
             f[bins] = h * d
             t = np.fft.ifft(f)

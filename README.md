@@ -12,8 +12,9 @@ channels. It is not a full 3GPP stack.
   **SI messages** (SIB2, SIB3, …) in their SI-windows, with the SIB2 reselection
   parameters in the report and everything in full through Wireshark.
 - **LTE:** cell search, MIB, PDCCH blind decoding, turbo-coded PDSCH, SIB1 (PLMN, TAC,
-  Cell ID), random access responses, paging, and live export to Wireshark.
-- Built-in eNB and gNB signal generators, 92 tests, and live verification on four
+  Cell ID), random access responses, paging, load monitoring (PDCCH and PRB use,
+  active devices, CSV time series), and live export to Wireshark.
+- Built-in eNB and gNB signal generators, 98 tests, and live verification on four
   Polish operators' networks.
 
 The 20 MHz HackRF is enough for NR too: an SS/PBCH block occupies 7.2 MHz even when
@@ -49,12 +50,13 @@ the carrier is 100 MHz wide (see [5G NR](#5g-nr)).
 | PBCH → **MIB** | bandwidth, number of ports (CRC mask), PHICH configuration, full SFN; single-frame decoding or soft combining of 4 frames |
 | PCFICH | CFI (1–3) |
 | PHICH | REG allocation (needed for PDCCH; including m_i for TDD) |
-| PDCCH | quadruplet de-interleaving, CCEs, blind decoding of the common search space (DCI 0/1A, 1C) for SI-/P-/RA-RNTI; optional discovery of active C-RNTIs (DCI 0/1A, 1) and CCE load |
+| PDCCH | quadruplet de-interleaving, CCEs, blind decoding of the common search space (DCI 0/1A, 1C) for SI-/P-/RA-RNTI; optional discovery of active C-RNTIs (DCI 0/1A, 1, 2 and 2A, i.e. also TM3/TM4 traffic) and CCE load |
+| Load | PRB use scheduled by the decoded downlink assignments (resource allocation types 0/1/2), uplink RBs granted by DCI 0, PRBs with PDSCH-region energy, active C-RNTIs per burst and per session |
 | PDSCH | type 2 allocation (localized and distributed VRB→PRB), TBS, QPSK, SFBC transmit diversity, rate matching, **turbo decoder** (max-log-MAP), CRC24A, HARQ combining of redundancy versions |
 | RRC (ASN.1 UPER) | **SIB1**: PLMN (MCC-MNC), TAC, Cell Identity (eNB ID + sector), band, cellBarred, q-RxLevMin, p-Max, SI scheduling, TDD configuration; SI messages: list of contained SIBs (full contents in Wireshark) |
 | MAC | **random access responses** (RA-RNTI: timing advance → UE distance, UL grant, temporary C-RNTI); **paging** (P-RNTI, opt-in, subscriber identities always masked) |
 | **Wireshark export** | every decoded transport block (MIB, SIB1, SI, RAR, paging) as MAC-LTE frames: live over UDP, into a pcap file, or piped into Wireshark; Wireshark then decodes all SIBs in full |
-| Monitor | continuous capture → decode → export loop on one carrier |
+| Monitor | continuous capture → decode → export loop on one carrier, load time series to CSV, automatic gain reduction on clipping |
 | Scanner | fast 20 MHz captures, spectrum-based carrier detection, candidate testing on the 100 kHz raster, learning the HackRF ppm error |
 
 It also includes a built-in **eNB signal generator** (`ltescan synth`) with a channel
@@ -232,7 +234,7 @@ The options work with `cell` (one capture) and `monitor`. `monitor` repeats shor
 captures (`--burst`, default 0.2 s) and prints one status line per burst:
 
 ```
-21:08:31 burst 4: PCI 112 SFN 1010 RSRP  -50.5 dBFS SINR  10.3 dB CFI 2 CCE  61% | SI 25 RAR 0 PCH 17 C-RNTI 6
+21:08:31 burst 4: PCI 112 SFN 1010 RSRP  -50.5 dBFS SINR  10.3 dB CFI 2 CCE  61% | SI 25 RAR 0 PCH 17 C-RNTI 6 | PRB DL  48% UL  2.4 RB/sf
 ```
 
 `monitor` is not continuous reception. Each burst is captured, then decoded, so there
@@ -396,12 +398,47 @@ IQ (HackRF / file)
            → ASN.1 UPER → SIB1 / SI
 ```
 
-C-RNTI discovery decodes every CCE position at every aggregation level. The RNTI is
-derived from the CRC remainder, so "every" position matches some RNTI. Genuine
-candidates are separated from noise by re-encoding the decoded bits and measuring the
-|LLR|-weighted agreement with the received soft bits. Random data reaches at most
-~0.95 / 0.83 / 0.73 / 0.67 for aggregation levels 1/2/4/8. The report only lists RNTIs
-seen at least twice.
+C-RNTI discovery decodes every CCE position at every aggregation level, with every
+DCI size the cell can use (0/1A, 1, and 2/2A with 2 or 4 ports). The RNTI is derived
+from the CRC remainder, so "every" position matches some RNTI. Genuine candidates are
+separated from noise in four steps:
+
+- re-encoding the decoded bits and measuring the |LLR|-weighted agreement with the
+  received soft bits (random data reaches at most ~0.95 / 0.83 / 0.73 / 0.67 for
+  aggregation levels 1/2/4/8); of the sizes that pass at one position the most
+  consistent wins;
+- resolving the real aggregation level: a DCI sent on 2, 4 or 8 CCEs also decodes from
+  its first CCE alone, and its remaining CCEs decoded on their own give a wrong RNTI
+  that repeats as long as the DCI does. The remaining CCEs are therefore compared with
+  the re-encoded codeword and, if they carry it, marked as used;
+- an eNB only places a C-RNTI's DCIs in that UE's search space (36.213 9.1.1; DCI 0/1A
+  also in the common one), so only such hits count;
+- the report lists RNTIs seen at least twice in a burst.
+
+**Load and number of devices.** `cell --rnti` and `monitor --rnti` report:
+
+- the CCE load of the PDCCH;
+- the share of PRBs scheduled by the decoded downlink DCIs (SI/P/RA-RNTI and C-RNTIs
+  that pass the checks above) and the uplink RBs granted per subframe. DCIs that do
+  not decode (weak, aggregation level 1 at low SINR) are missed, so this is a lower
+  bound; on a live 5 MHz cell it followed the CCE load closely;
+- the number of active C-RNTIs per burst and over the session. A C-RNTI belongs to one
+  device in RRC_CONNECTED; idle devices are invisible (only paging, for the whole
+  tracking area), a device that reconnects gets a new C-RNTI, and the bursts have gaps.
+  So these are devices with traffic in the observation windows, not subscribers;
+- in JSON/CSV also the share of PRBs whose PDSCH region carries energy above the CRS
+  noise and interference level. It needs no decoding but counts the neighbours'
+  traffic as well, so in an interference-limited cell it overestimates.
+
+`monitor --csv FILE` appends one line per burst (time, PCI, SFN, RSRP, SINR, CFI, CCE
+load, PRB use, uplink RBs, C-RNTIs: in the burst, new, distinct so far, SI/RAR/paging
+counts) for plotting or long-term logging. A live example (5 MHz cell, 20 bursts of
+0.3 s, about one minute): 2–14 C-RNTIs per burst, most of them seen again in later
+bursts, 81 distinct in the minute, CCE load 23–59 %, downlink PRB use 22–75 %.
+
+`monitor` lowers the VGA gain by 6 dB when a burst clips (clipping breaks the
+synchronisation) and follows one cell: if it is not among the strongest detections of a
+burst, the search is repeated around its last frequency offset.
 
 Weaker cells found after interference cancellation whose MIB cannot be decoded are
 listed in one line as unconfirmed (they can be residues of the strongest cell); `--all`
@@ -416,6 +453,9 @@ subframe of signal:
 |---|---|---|
 | without C-RNTI discovery | 9.1 ms | 4.3 ms |
 | with C-RNTI discovery | 23.3 ms | 5.7 ms |
+
+C-RNTI discovery now also tries the format 2/2A sizes; on a 5 MHz cell with numba it
+takes 2.9 ms per subframe (1.9 ms without discovery).
 
 Without numba, Viterbi decoding of hundreds of PDCCH candidates dominated. The rest is
 interpreter overhead spread over many small operations (channel estimation, REG
@@ -468,7 +508,7 @@ ltescan/
     rrc.py      ASN.1 UPER: NR SIB1, SystemInformation, SIB2 head
     synth.py    gNB generator: SSB bursts, SIB1 and SI messages (PDCCH + PDSCH)
     report.py   NR text/JSON reports
-tests/          92 tests (unit, end-to-end on synthetic signals, Wireshark dissection)
+tests/          98 tests (unit, end-to-end on synthetic signals, Wireshark dissection)
 ```
 
 Tests: `pytest -q` (1–2 min). The Wireshark tests run when `tshark` is installed.

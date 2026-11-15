@@ -40,6 +40,9 @@ def cell_text(rep: CellReport, show_dci: int = 0) -> str:
         cfi = ", ".join(f"CFI{k}: {v}" for k, v in sorted(rep.cfi_hist.items()))
         load = np.mean(rep.cce_load) * 100 if rep.cce_load else 0
         L.append(f"Analyzed {rep.subframes} subframes; {cfi}; PDCCH CCE load ~ {load:.0f}%")
+        ld = load_summary(rep)
+        if ld:
+            L.append(ld)
     if rep.sib1:
         L.append("SIB1:" + (f" (after {rep.sib1_tx} transmissions)" if rep.sib1_tx > 1 else ""))
         L += ["  " + x for x in rep.sib1.lines()]
@@ -90,7 +93,24 @@ def burst_line(stamp: str, n: int, rep: CellReport, counts: dict) -> str:
     conf = rep.confirmed_rntis()
     if conf:
         s += f" C-RNTI {len(conf)}"
+    if rep.prb_dl:
+        s += f" | PRB DL {np.mean(rep.prb_dl) * 100:3.0f}%"
+    if rep.ul_prbs:
+        s += f" UL {np.mean(rep.ul_prbs):4.1f} RB/sf"
     return s
+
+
+def load_summary(rep: CellReport) -> str:
+    """Resource use: PRB shares per subframe (from the decoded DCIs and
+    from PDSCH energy) and uplink RBs granted per subframe."""
+    if not rep.prb_energy:
+        return ""
+    s = ""
+    if rep.prb_dl:
+        s = (f"PDSCH PRB use ~ {np.mean(rep.prb_dl) * 100:.0f}% (decoded DCIs, a lower bound); "
+             f"PUSCH grants ~ {np.mean(rep.ul_prbs):.1f} RB per subframe; ")
+    return s + (f"PRBs with PDSCH-region energy ~ {np.mean(rep.prb_energy) * 100:.0f}% "
+                f"(includes neighbour interference)")
 
 
 def scan_table(reports: list[CellReport]) -> str:
@@ -125,6 +145,9 @@ def to_dict(rep: CellReport) -> dict:
         "mib": None, "sib1": None, "si": [], "cfi": dict(rep.cfi_hist),
         "subframes": rep.subframes, "paging_subframes": rep.paging, "rar": rep.rar,
         "cce_load": float(np.mean(rep.cce_load)) if rep.cce_load else None,
+        "prb_dl_dci": float(np.mean(rep.prb_dl)) if rep.prb_dl else None,
+        "prb_dl_energy": float(np.mean(rep.prb_energy)) if rep.prb_energy else None,
+        "ul_rb_per_subframe": float(np.mean(rep.ul_prbs)) if rep.ul_prbs else None,
         "c_rnti": {f"0x{r:04x}": n for r, n in rep.confirmed_rntis().items()},
         "rar_responses": [{"rapid": e.rapid, "ta": e.ta, "distance_m": round(e.distance_m),
                            "temp_crnti": f"0x{e.temp_crnti:04x}"} for e in rep.rar_entries],
