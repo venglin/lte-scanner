@@ -338,6 +338,99 @@ def cmd_monitor(a):
     return 0
 
 
+def _nr_plan(a, fs):
+    """List of captures (centre frequency, SCS, GSCNs or None = all)."""
+    from .nr.params import NR_BANDS, arfcn_to_freq, gscn_to_freq
+    scs = int(a.scs * 1000) if a.scs else None
+    if a.band:
+        name = a.band.lower()
+        name = name if name.startswith("n") else "n" + name
+        if name not in NR_BANDS:
+            raise SystemExit(f"unknown NR band {a.band} (known: {', '.join(NR_BANDS)})")
+        b = NR_BANDS[name]
+        s = scs or b.scs
+        reach = 0.4 * fs - 120 * s - (a.cfo_max or max(15e3, 20e-6 * b.dl_hi))
+        todo = b.gscns()
+        plan = []
+        while todo:
+            fc = gscn_to_freq(todo[0]) + reach
+            grp = [g for g in todo if abs(gscn_to_freq(g) - fc) <= reach]
+            plan.append((fc, s, grp))
+            todo = [g for g in todo if g not in grp]
+        return plan
+    if a.gscn:
+        # tune 2 MHz away so that the HackRF DC spike misses the SSB centre
+        return [(gscn_to_freq(a.gscn) + 2e6, scs, [a.gscn])]
+    if a.arfcn:
+        return [(arfcn_to_freq(a.arfcn) + 2e6, scs, None)]
+    if not a.freq:
+        raise SystemExit("give --freq, --gscn, --arfcn or --band")
+    return [(parse_freq(a.freq), scs, None)]
+
+
+def cmd_nr(a):
+    """5G NR SS/PBCH block search and MIB decoding."""
+    import json
+    from .nr import report as nrrep
+    from .nr.search import ssb_search
+    t0 = time.time()
+    cells = []
+
+    def merge(found):
+        for c in found:
+            old = next((o for o in cells if o.n_id == c.n_id
+                        and abs(o.f_ref + o.cfo - c.f_ref - c.cfo) < c.scs), None)
+            if old is None:
+                cells.append(c)
+            elif (c.confirmed, c.rsrp_dbfs) > (old.confirmed, old.rsrp_dbfs):
+                cells[cells.index(old)] = c
+
+    if a.file:
+        x, fs, fc = load_file(a, a.duration)
+        if fc is None:
+            raise SystemExit("give --freq (no .json metadata file)")
+        scs = int(a.scs * 1000) if a.scs else None
+        merge(ssb_search(x, fs, fc, scs=scs, gscns=[a.gscn] if a.gscn else None,
+                         cfo_max=a.cfo_max, log=log))
+    else:
+        fs = a.rate
+        plan = _nr_plan(a, fs)
+        src = open_source(a)
+        for i, (fc, scs, grp) in enumerate(plan):
+            log(f"capturing {a.duration:.3f} s @ {fc / 1e6:.3f} MHz, {fs / 1e6:.2f} Msps ...")
+            cap = src.capture(fc, fs, int(a.duration * fs), bb_filter=0.75 * fs)
+            found = ssb_search(cap.x, cap.fs, fc, scs=scs, gscns=grp, cfo_max=a.cfo_max,
+                               log=None if a.band else log)
+            merge(found)
+            if a.band:
+                conf = [c for c in found if c.confirmed]
+                log(f"[{i + 1}/{len(plan)}] {fc / 1e6:.1f} MHz: "
+                    + (", ".join(f"PCI {c.n_id} @ {c.f_ref / 1e6:.2f} MHz" for c in conf)
+                       or "-"))
+    cells.sort(key=lambda c: (not c.confirmed, c.f_ref, -c.rsrp_dbfs))
+    shown = [c for c in cells if c.confirmed or a.all]
+    hidden = len(cells) - len(shown)
+    note = (f"({hidden} SSB detection(s) without a valid PBCH CRC hidden; --all shows them)"
+            if hidden else "")
+    if not shown:
+        print("No NR cell found." + (" " + note if note else ""))
+        return 1
+    if len(shown) > 1:
+        print(nrrep.scan_table(shown))
+        print()
+    for c in shown:
+        print(nrrep.cell_text(c))
+        print()
+    if note:
+        print(note)
+    if a.json:
+        with open(a.json, "w", encoding="utf-8") as f:
+            json.dump([nrrep.to_dict(c) for c in shown], f, indent=2)
+        log(f"saved {a.json}")
+    log(f"done in {time.time() - t0:.1f} s")
+    return 0
+
+
 def cmd_synth(a):
     from .dsp import resample
     from .params import CellConfig
@@ -443,6 +536,26 @@ def build_parser():
     add_sdr_args(s)
     add_file_args(s)
     s.set_defaults(func=cmd_monitor)
+
+    s = sub.add_parser("nr", help="5G NR: find SS/PBCH blocks and decode the MIB")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--freq", help="capture centre frequency (all GSCNs inside are searched)")
+    g.add_argument("--gscn", type=int, help="one synchronization raster entry")
+    g.add_argument("--arfcn", type=int, help="SSB NR-ARFCN (absoluteFrequencySSB)")
+    g.add_argument("--band", help="scan a whole NR band, e.g. n78")
+    s.add_argument("--scs", type=int, choices=[15, 30],
+                   help="SSB subcarrier spacing [kHz] (default: from the band)")
+    s.add_argument("--rate", type=float, default=20e6, help="sample rate (default 20 Msps)")
+    s.add_argument("--duration", type=float, default=0.045,
+                   help="capture length [s] (default 0.045 = two 20 ms SSB periods)")
+    s.add_argument("--cfo-max", type=float, default=None,
+                   help="CFO search range [Hz] (default: 20 ppm of the frequency)")
+    s.add_argument("--all", action="store_true",
+                   help="also show SSB detections whose PBCH did not decode")
+    s.add_argument("--json", help="save results to JSON")
+    add_sdr_args(s)
+    add_file_args(s)
+    s.set_defaults(func=cmd_nr)
 
     s = sub.add_parser("synth", help="generate a synthetic LTE signal for testing")
     s.add_argument("--out", required=True)

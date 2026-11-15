@@ -1,8 +1,8 @@
 # lte-scanner — LTE PHY scanner and analyzer for HackRF
 
-A passive LTE downlink receiver written in pure Python (NumPy/SciPy). It is not a full
-3GPP stack. It demodulates the physical layer and understands the broadcast and control
-channels:
+A passive LTE downlink receiver written in pure Python (NumPy/SciPy), with a 5G NR
+cell search on top. It is not a full 3GPP stack. It demodulates the physical layer and
+understands the broadcast and control channels:
 
 | Layer | What is implemented |
 |---|---|
@@ -19,6 +19,7 @@ channels:
 | MAC | **random access responses** (RA-RNTI: timing advance → UE distance, UL grant, temporary C-RNTI); **paging** (P-RNTI, opt-in, subscriber identities always masked) |
 | **Wireshark export** | every decoded transport block (MIB, SIB1, SI, RAR, paging) as MAC-LTE frames: live over UDP, into a pcap file, or piped into Wireshark; Wireshark then decodes all SIBs in full |
 | Monitor | continuous capture → decode → export loop on one carrier |
+| **5G NR** (FR1) | SS/PBCH block search on the synchronization raster (GSCN), PSS/SSS (1008 PCIs), PBCH DMRS (SSB index), polar-coded PBCH with CRC-aided list decoding, **MIB** (SFN, k_SSB, CORESET#0 / search space #0, cellBarred, SIB1 presence → SA vs NSA), SS-RSRP per SSB beam |
 | Scanner | fast 20 MHz captures, spectrum-based carrier detection, candidate testing on the 100 kHz raster, learning the HackRF ppm error |
 
 It also includes a built-in **eNB signal generator** (`ltescan synth`) with a channel
@@ -74,6 +75,9 @@ ltescan cell --file b3.cs8
 
 # follow one carrier and stream everything to Wireshark (see below)
 ltescan monitor --earfcn 1575 --paging --rnti --pcap - | wireshark -k -i -
+
+# 5G NR: scan a band for SS/PBCH blocks and decode their MIB (see below)
+ltescan nr --band n78 --ppm 13 --lna 40 --vga 30 --amp
 ```
 
 Without hardware:
@@ -155,6 +159,44 @@ captures (`--burst`, default 0.2 s) and prints one status line per burst:
 `monitor` is not continuous reception. Each burst is captured, then decoded, so there
 are gaps between bursts (about 3 s per cycle for a 0.3 s burst with HackRF, mostly
 `hackrf_transfer` start-up and decoding).
+
+## 5G NR
+
+`ltescan nr` finds NR cells (FR1) by their SS/PBCH blocks and decodes the MIB:
+
+```
+ltescan nr --band n78                # whole band, one 20 Msps capture per ~9 MHz
+ltescan nr --freq 3650               # every raster entry (GSCN) inside one capture
+ltescan nr --gscn 7880               # one raster entry
+ltescan nr --arfcn 643296            # SSB ARFCN (absoluteFrequencySSB from RRC)
+ltescan nr --file n78.cs8 --json nr.json
+```
+
+Known bands: n1, n3, n7, n8, n20, n28, n38, n40, n41, n77, n78. The SSB subcarrier
+spacing comes from the band (`--scs 15|30` overrides it, e.g. for n38/n41 which allow
+both). The default capture is 45 ms, two SSB periods of 20 ms. Cells that send SSBs
+less often (NSA cells may use up to 160 ms) need a longer `--duration`.
+
+Per cell the report shows PCI, SSB frequency, GSCN and ARFCN, the SSB indices (beams)
+received with their SS-RSRP, SS-SINR, frequency offset, and the MIB: SFN, half frame,
+SSB index, subCarrierSpacingCommon, k_SSB, controlResourceSetZero, searchSpaceZero,
+dmrs-TypeA-Position, cellBarred and intraFreqReselection. k_SSB tells whether the SSB
+has a CORESET#0 for SIB1. Without one (k_SSB = 31) the cell is typically a
+non-standalone (EN-DC) cell anchored on LTE.
+
+How it works:
+
+1. **PSS search.** One FFT of the whole capture; for every GSCN and frequency-offset
+   hypothesis the PSS sub-band is cut out of that spectrum (ideal decimation) and
+   correlated with the three PSS m-sequences by a small IFFT.
+2. **SSS and SSB index.** Each PSS peak is cut out of the full-rate signal, shifted to
+   baseband and resampled to 512 × SCS. Timing and CFO are refined on the PSS (with the
+   data around the SSB filtered out) and on the DMRS phase. The SSS gives N_ID1 and the
+   PBCH DMRS (8 hypotheses) the 3 LSBs of the SSB index.
+3. **PBCH.** DMRS channel estimate (phase slope removed, then smoothed), equalization,
+   descrambling, repetition combining, polar SCL decoding (list 8, CRC24C) and the
+   38.212 payload de-interleaving/descrambling give the MIB. Below 3 GHz both
+   L_max = 4 and 8 interpretations are tried where the band allows them.
 
 ## How it works
 
@@ -238,10 +280,17 @@ ltescan/
   export.py     MAC-LTE framing, UDP and pcap sinks for Wireshark
   _jit.py       optional numba kernels (Viterbi, turbo max-log-MAP)
   cli.py        command-line interface
-tests/          59 tests (unit, end-to-end on synthetic signals, Wireshark dissection)
+  nr/           5G NR
+    params.py   GSCN / NR-ARFCN raster, bands, L_max
+    polar.py    polar code: reliability sequence, interleavers, encoder, SCL decoder
+    pbch.py     PSS/SSS/DMRS, SSB layout, PBCH payload coding, MIB
+    search.py   SS/PBCH block search, demodulation, MIB decoding
+    synth.py    gNB SSB burst generator
+    report.py   NR text/JSON reports
+tests/          69 tests (unit, end-to-end on synthetic signals, Wireshark dissection)
 ```
 
-Tests: `pytest -q` (~35 s). The Wireshark tests run when `tshark` is installed.
+Tests: `pytest -q` (~45 s). The Wireshark tests run when `tshark` is installed.
 
 ## Verification and limitations
 
@@ -251,6 +300,8 @@ Tests: `pytest -q` (~35 s). The Wireshark tests run when `tshark` is installed.
 - the turbo QPP tables: srsRAN sources plus a check that each of the 188 entries is a
   permutation;
 - the TBS columns for N_PRB = 2/3 (srsRAN);
+- NR: the polar reliability sequence, the input and sub-block interleavers, the PBCH
+  payload interleaver G and the PBCH payload scrambling rules (srsRAN);
 - DCI sizes for all bandwidths;
 - EARFCN conversions.
 
@@ -273,13 +324,16 @@ Tests: `pytest -q` (~35 s). The Wireshark tests run when `tshark` is installed.
   (SIB2, SIB3, SIB5, paging records);
 - a 20 MHz cell decoded from a 20 Msps capture;
 - co-channel cells resolved on the same carrier;
-- the receiver clock error (here +13 ppm) estimated and then corrected with `--ppm`.
+- the receiver clock error (here +13 ppm) estimated and then corrected with `--ppm`;
+- 5G NR: MIB decoded from a non-standalone TDD cell in n38 (30 kHz SSB, k_SSB = 31)
+  and from two SSBs with CORESET#0 in n28 (15 kHz, L_max = 4).
 
 Parts of the specification that the live tests did not exercise are checked only
 against the built-in generator, which shares the receiver's reading of the
 specification:
 
-- TDD (band 38 was not received at the test location);
+- LTE TDD (at the test location band 38 carries only NR);
+- NR in n78 (no signal at the test location) and L_max = 64 (FR2, not supported);
 - extended PHICH duration and extended CP;
 - distributed VRB allocation and DCI 1C;
 - PDSCH RE exclusions around PSS/SSS/PBCH for 25-RB cells;
@@ -295,7 +349,9 @@ Other limitations:
   and 5 are analyzed, and special subframes are skipped;
 - not real time: about 4–6 ms per subframe with numba (see Performance), so `monitor`
   works in bursts with gaps;
-- RSRP is reported in dBFS. A value in dBm needs calibration of the receive chain.
+- RSRP is reported in dBFS. A value in dBm needs calibration of the receive chain;
+- NR: only the SS/PBCH block and the MIB. SIB1 (PDCCH in CORESET#0, LDPC-coded PDSCH)
+  is not decoded yet; FR1 only.
 
 ## Legal notes
 
